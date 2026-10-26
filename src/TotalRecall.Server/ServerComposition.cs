@@ -1,0 +1,885 @@
+// src/TotalRecall.Server/ServerComposition.cs
+//
+// Plan 6 Task 6.3a — production composition root for the MCP server.
+//
+// Responsibilities split between two entry points:
+//
+//   1. BuildRegistry(...) — pure function that takes pre-built infrastructure
+//      singletons plus a SessionLifecycle and StatusOptions, constructs all
+//      41 core handlers, and registers them in a ToolRegistry. Pure means no I/O
+//      and no disposal — all of that is the caller's job. This seam exists
+//      for testability: a unit test can inject fakes and assert the handler
+//      set is complete (count + expected names) without opening a real DB.
+//
+//   2. OpenProduction() — detects config and opens either a Postgres data
+//      source or a Sqlite connection, runs schema migrations, constructs
+//      OnnxEmbedder + all Infrastructure singletons, and returns a
+//      ServerCompositionHandles that the Host can dispose on shutdown.
+//      The Host is responsible for running
+//      AutoMigrationGuard.CheckAndMigrateAsync BEFORE calling this (so the
+//      migration path can rename the old DB before we open a handle on it).
+//
+// Handler budget: Memory (19) + KB (8) + Session (4) + Eval (5) + Config (2) + Misc (4) + Insights (1) = 43.
+//
+// AOT: no reflection. Every handler is constructed via direct `new`. The
+// Eval/Config/ImportHost/CompactNow handlers have no-arg constructors that
+// self-bootstrap their own short-lived Sqlite connection per invocation;
+// this file registers them via `new` and lets them own that lifecycle.
+// Memory/KB/Session/Status handlers share the process-lifetime connection
+// via the borrowed-connection pattern (Infrastructure classes take a
+// MsSqliteConnection and don't dispose it).
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Microsoft.FSharp.Core;
+using Npgsql;
+using TotalRecall.Infrastructure.Config;
+using TotalRecall.Infrastructure.Embedding;
+using TotalRecall.Infrastructure.Importers;
+using TotalRecall.Infrastructure.Ingestion;
+using TotalRecall.Infrastructure.Memory;
+using TotalRecall.Infrastructure.Search;
+using TotalRecall.Infrastructure.Skills;
+using TotalRecall.Infrastructure.Storage;
+using TotalRecall.Infrastructure.Sync;
+using TotalRecall.Infrastructure.Telemetry;
+using TotalRecall.Server.Handlers;
+using MsSqliteConnection = Microsoft.Data.Sqlite.SqliteConnection;
+
+namespace TotalRecall.Server;
+
+/// <summary>
+/// Bundle of disposable resources owned by the production composition root.
+/// The Host disposes this on shutdown (Ctrl+C / SIGTERM / shutdown RPC) so
+/// the underlying resource (Sqlite connection or Npgsql data source) releases
+/// cleanly.
+/// </summary>
+public sealed class ServerCompositionHandles : IDisposable
+{
+    private readonly IDisposable _resource;
+    private readonly Infrastructure.Sync.PeriodicSync? _periodicSync;
+    private readonly System.Threading.CancellationTokenSource? _reindexCts;
+    public ToolRegistry Registry { get; }
+
+    /// <summary>
+    /// The <see cref="IStore"/> backing this composition (SqliteStore, PostgresStore,
+    /// or RoutingStore in cortex mode). Exposed for test assertions.
+    /// </summary>
+    public IStore Store { get; }
+
+    /// <summary>
+    /// Human-friendly label for the effective storage backend, e.g. "sqlite",
+    /// "postgres", "cortex", or "sqlite (cortex failed)" when a fallback occurred.
+    /// </summary>
+    public string StorageMode { get; }
+
+    /// <summary>
+    /// Live progress of an in-process background re-index, when one was started
+    /// at composition (on_model_change=auto + a mismatched/unstamped-populated
+    /// local index). Null when no background re-index is running. Read by
+    /// session_start / the status tool to surface "re-indexing" state.
+    /// </summary>
+    public ReindexProgress? ReindexProgress { get; }
+
+    /// <summary>
+    /// Whether this composition wired an upload-capable skill client (cortex
+    /// mode with [skill] auto_import = true). False in sqlite/postgres mode,
+    /// and false in cortex mode unless explicitly opted into. Exposed for
+    /// test assertions.
+    /// </summary>
+    public bool SkillAutoImportEnabled { get; }
+
+    internal ServerCompositionHandles(IDisposable resource, ToolRegistry registry, IStore store, string storageMode = "sqlite", Infrastructure.Sync.PeriodicSync? periodicSync = null, ReindexProgress? reindexProgress = null, System.Threading.CancellationTokenSource? reindexCts = null, bool skillAutoImportEnabled = false)
+    {
+        _resource = resource;
+        Registry = registry;
+        Store = store;
+        StorageMode = storageMode;
+        _periodicSync = periodicSync;
+        ReindexProgress = reindexProgress;
+        _reindexCts = reindexCts;
+        SkillAutoImportEnabled = skillAutoImportEnabled;
+    }
+
+    public void Dispose()
+    {
+        // Signal the background re-index worker to stop BEFORE tearing down the
+        // primary resource. The worker owns its OWN connection (so it isn't using
+        // _resource), but RunBatched commits per batch + persists a resume cursor,
+        // so cancelling between batches is a clean, resumable shutdown. Best-effort
+        // — disposal must never throw.
+        try { _reindexCts?.Cancel(); } catch { /* best-effort */ }
+        try { _reindexCts?.Dispose(); } catch { /* best-effort */ }
+        try { _periodicSync?.Dispose(); } catch { /* best-effort */ }
+        try { _resource.Dispose(); } catch { /* best-effort */ }
+    }
+}
+
+/// <summary>
+/// Production composition root for the MCP server.
+/// </summary>
+public static class ServerComposition
+{
+    /// <summary>
+    /// Build a ToolRegistry populated with all production handlers using
+    /// the supplied Infrastructure singletons. Pure: no I/O, no disposal.
+    /// Callable from both production (OpenProduction) and tests.
+    /// </summary>
+    public static ToolRegistry BuildRegistry(
+        IStore store,
+        IVectorSearch vectors,
+        IEmbedder embedder,
+        IHybridSearch hybrid,
+        IFileIngester fileIngester,
+        ICompactionLogReader compactionLog,
+        ISessionLifecycle sessionLifecycle,
+        StatusOptions statusOptions,
+        Infrastructure.Sync.SyncService? syncService = null,
+        Infrastructure.Sync.IRemoteBackend? remoteBackend = null,
+        Infrastructure.Sync.PeriodicSync? periodicSync = null,
+        string? scopeDefault = null,
+        RetrievalEventLog? retrievalLog = null,
+        Infrastructure.Sync.SyncQueue? syncQueue = null,
+        CompactionLog? compactionLogWriter = null,
+        Infrastructure.Sync.SyncBacklogReader? syncBacklog = null,
+        int pinnedMaxChars = PinnedTierLimits.DefaultMaxContentChars,
+        int hotMaxChars = 1200,
+        ReindexProgress? reindexProgress = null,
+        string querySource = "assistant")
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        ArgumentNullException.ThrowIfNull(vectors);
+        ArgumentNullException.ThrowIfNull(embedder);
+        ArgumentNullException.ThrowIfNull(hybrid);
+        ArgumentNullException.ThrowIfNull(fileIngester);
+        ArgumentNullException.ThrowIfNull(compactionLog);
+        ArgumentNullException.ThrowIfNull(sessionLifecycle);
+        ArgumentNullException.ThrowIfNull(statusOptions);
+
+        var registry = new ToolRegistry();
+
+        // ---- Memory (18, +1 assistant-only memory_feedback when a
+        //      RetrievalEventLog is wired — see below) ----
+        registry.Register(new MemoryStoreHandler(store, embedder, vectors, scopeDefault, pinnedMaxChars, hotMaxChars));
+        registry.Register(new MemorySearchHandler(embedder, hybrid, scopeDefault, retrievalLog, syncQueue, querySource));
+        // Assistant-only feedback tool (Task 1.6). Registered immediately after
+        // memory_search because it consumes the retrievalId memory_search emits.
+        // Both production paths (sqlite + cortex) wire a RetrievalEventLog, so
+        // this is always present in production; the null-guard keeps the
+        // postgres/no-telemetry path clean. NOT added to the Web ToolAllowlist:
+        // the browser must never reach it.
+        if (retrievalLog is not null)
+            registry.Register(new MemoryFeedbackHandler(retrievalLog));
+        registry.Register(new MemoryGetHandler(store));
+        registry.Register(new MemoryGetAllHandler(store));
+        registry.Register(new MemoryUpdateHandler(store, embedder, vectors));
+        registry.Register(new MemoryDeleteHandler(store, vectors));
+        registry.Register(new MemoryPromoteHandler(store, vectors, embedder, compactionLogWriter, syncQueue));
+        registry.Register(new MemoryDemoteHandler(store, vectors, embedder, compactionLogWriter, syncQueue));
+        // Tier model v2 (Task 5): pins now land in hot as sticky rows, so the
+        // pin handler enforces the HOT content cap (not the retired pinned cap).
+        registry.Register(new MemoryPinHandler(store, vectors, embedder, compactionLogWriter, syncQueue, hotMaxChars));
+        registry.Register(new MemoryUnpinHandler(store, vectors, embedder, compactionLogWriter, syncQueue));
+        registry.Register(new MemoryInspectHandler(store, compactionLog));
+        registry.Register(new MemoryHistoryHandler(compactionLog));
+        registry.Register(new MemoryRecentHandler(store, scopeDefault));
+        registry.Register(new MemoryListHandler(store));
+        registry.Register(new MemoryLineageHandler(compactionLog));
+        registry.Register(new MemoryExportHandler(store));
+        registry.Register(new MemoryImportHandler(store, vectors, embedder));
+        registry.Register(new MemoryExtractHandler(store, embedder, scopeDefault));
+
+        // ---- KB (8) ----
+        registry.Register(new KbSearchHandler(embedder, hybrid, remoteBackend, scopeDefault, retrievalLog, syncQueue, querySource));
+        registry.Register(new KbIngestFileHandler(fileIngester, scopeDefault));
+        registry.Register(new KbIngestDirHandler(fileIngester, scopeDefault));
+        registry.Register(new KbListCollectionsHandler(store));
+        registry.Register(new KbRefreshHandler(store, vectors, fileIngester));
+        registry.Register(new KbRemoveHandler(store, vectors));
+        registry.Register(new KbSummarizeHandler(store));
+        registry.Register(new KbResolveHandler(store));
+
+        // ---- Session (4) ----
+        registry.Register(new SessionStartHandler(sessionLifecycle, periodicSync, syncService));
+        registry.Register(new SessionEndHandler(sessionLifecycle, store, compactionLogWriter, syncService: syncService, hotMaxContentChars: hotMaxChars));
+        registry.Register(new SessionContextHandler(store));
+        registry.Register(new SessionRefreshHandler(sessionLifecycle));
+
+        // ---- Eval (5) — self-bootstrap production executors ----
+        registry.Register(new EvalReportHandler());
+        registry.Register(new EvalBenchmarkHandler());
+        registry.Register(new EvalCompareHandler());
+        registry.Register(new EvalSnapshotHandler());
+        registry.Register(new EvalGrowHandler());
+
+        // ---- Config (2) — self-bootstrap via ConfigLoader ----
+        registry.Register(new ConfigGetHandler());
+        registry.Register(new ConfigSetHandler());
+
+        // ---- Misc (4) ----
+        registry.Register(new StatusHandler(store, sessionLifecycle, statusOptions, syncBacklog, reindexProgress));
+        registry.Register(new ImportHostHandler()); // self-bootstraps the 7 importers
+        registry.Register(new CompactNowHandler());
+        registry.Register(new MigrateToRemoteHandler()); // self-bootstraps source+target stores
+
+        // ---- Insights (1) — self-bootstraps a short-lived local SQLite store ----
+        registry.Register(new InsightsHandler());
+
+        return registry;
+    }
+
+    /// <summary>
+    /// Detect config and open the appropriate backend (Postgres or SQLite).
+    /// When a Postgres connection string is configured, opens a
+    /// <see cref="NpgsqlDataSource"/>; otherwise opens a SQLite connection at
+    /// the standard user path.
+    /// </summary>
+    /// <remarks>
+    /// The caller is responsible for running
+    /// <see cref="AutoMigrationGuard.CheckAndMigrateAsync"/> BEFORE calling
+    /// this method, so the legacy TS-format DB (if any) is renamed out of
+    /// the way before we open a handle.
+    /// </remarks>
+    public static ServerCompositionHandles OpenProduction(string? dbPath = null, string querySource = "assistant")
+    {
+        var cfg = new ConfigLoader().LoadEffectiveConfig();
+
+        var configuredMode = "local";
+        if (FSharpOption<Core.Config.StorageConfig>.get_IsSome(cfg.Storage)
+            && FSharpOption<string>.get_IsSome(cfg.Storage.Value.Mode))
+        {
+            configuredMode = cfg.Storage.Value.Mode.Value;
+        }
+        else if (FSharpOption<Core.Config.StorageConfig>.get_IsSome(cfg.Storage)
+            && FSharpOption<string>.get_IsSome(cfg.Storage.Value.ConnectionString))
+        {
+            configuredMode = "postgres";
+        }
+
+        // Map config values to friendly display names.
+        static string FriendlyName(string mode) => mode switch
+        {
+            "local" => "sqlite",
+            _ => mode
+        };
+
+        try
+        {
+            return configuredMode switch
+            {
+                "cortex" => OpenCortex(cfg, dbPath, FriendlyName(configuredMode), querySource),
+                "postgres" => OpenPostgres(cfg, FriendlyName(configuredMode), querySource),
+                _ => OpenSqlite(cfg, dbPath, FriendlyName(configuredMode), querySource)
+            };
+        }
+        catch (Exception ex) when (configuredMode is "cortex" or "postgres")
+        {
+            // Non-local backend failed — fall back to SQLite so the session
+            // is still usable, and surface what happened in the storage label.
+            var friendly = FriendlyName(configuredMode);
+            Console.Error.WriteLine(
+                $"[total-recall] {friendly} storage failed, falling back to sqlite: {ex.Message}");
+            return OpenSqlite(cfg, dbPath, $"sqlite ({friendly} failed)", querySource);
+        }
+    }
+
+    /// <summary>
+    /// Build the LOCAL (sqlite) tool surface against a throwaway <paramref name="dbPath"/>,
+    /// IGNORING the machine's configured backend (OpenSqlite does not consult
+    /// cfg.Storage.Mode). Used by <see cref="CatalogDumper"/> to emit the committed
+    /// catalog.json. Unlike forcing local mode via environment variables, this does
+    /// NOT mutate process-wide state — essential because xunit runs the catalog test
+    /// concurrently with tests that read TOTAL_RECALL_* env, and mutating that env
+    /// would race them into flaky failures.
+    /// </summary>
+    internal static ServerCompositionHandles OpenLocalForCatalog(string dbPath)
+    {
+        var cfg = new ConfigLoader().LoadEffectiveConfig();
+        return OpenSqlite(cfg, dbPath, "sqlite");
+    }
+
+    // Resolve the embedder model-change policy from config (FSharp option interop
+    // in one place). Used by every backend's startup migration call.
+    private static OnModelChange ResolveOnModelChange(Core.Config.TotalRecallConfig cfg) =>
+        OnModelChangePolicy.Parse(
+            FSharpOption<string>.get_IsSome(cfg.Embedding.OnModelChange) ? cfg.Embedding.OnModelChange.Value : null);
+
+    /// <summary>
+    /// Given the <see cref="EmbedderMigration.EnsureCompatibleSqlite"/> decision,
+    /// start an IN-PROCESS background re-index worker when (and only when) the
+    /// decision is <see cref="EmbedderCompatibility.ReindexInBackground"/>. Returns
+    /// the live <see cref="ReindexProgress"/> and the <see cref="System.Threading.CancellationTokenSource"/>
+    /// that owns the worker's lifetime (both null when no worker is started) so the
+    /// composition handles can surface progress and cancel on dispose.
+    ///
+    /// Fire-and-forget: the slow re-embed stays off the MCP handshake path — this
+    /// returns essentially immediately. The worker opens its OWN sqlite connection
+    /// and its OWN embedder because Microsoft.Data.Sqlite connections are not
+    /// thread-safe to share and the server's primary connection is used by request
+    /// handlers on other threads.
+    /// </summary>
+    /// <param name="embedderFactory">Seam for tests to inject a deterministic
+    /// embedder; defaults to <see cref="EmbedderFactory.CreateFromConfig"/> over
+    /// <paramref name="embCfg"/> (the real ONNX embedder in production).</param>
+    internal static (ReindexProgress?, System.Threading.CancellationTokenSource?) MaybeStartBackgroundReindex(
+        EmbedderCompatibility decision, string resolvedDbPath, Core.Config.EmbeddingConfig embCfg,
+        Func<IEmbedder>? embedderFactory = null)
+    {
+        if (decision != EmbedderCompatibility.ReindexInBackground) return (null, null);
+
+        var progress = new ReindexProgress();
+        var cts = new System.Threading.CancellationTokenSource();
+        var ct = cts.Token;
+        var makeEmbedder = embedderFactory ?? (() => EmbedderFactory.CreateFromConfig(embCfg));
+
+        Console.Error.WriteLine(
+            "[total-recall] embedding model changed; starting background re-index of local vectors. " +
+            "Retrieval quality is degraded until it completes.");
+
+        System.Threading.Tasks.Task.Run(() =>
+        {
+            // OWN connection + OWN embedder: the server's primary connection is used by
+            // request handlers on other threads; Microsoft.Data.Sqlite connections are not
+            // thread-safe to share, and the ONNX InferenceSession gets its own instance.
+            IEmbedder? wembedder = null;
+            try
+            {
+                using var wconn = SqliteConnection.Open(resolvedDbPath); // WAL + busy_timeout already set; loads sqlite-vec
+                var wstore = new SqliteStore(wconn);
+                var wvec = new VectorSearch(wconn);
+                wembedder = makeEmbedder();
+                new ReindexCoordinator().Run(wconn, wstore, wvec, wembedder, progress, ct, Console.Error);
+            }
+            catch (OperationCanceledException) { /* shutdown; resume next boot */ }
+            catch (Exception) when (ct.IsCancellationRequested) { /* cancel race (e.g. CTS disposed mid-cancel) — clean shutdown */ }
+            catch (Exception ex)
+            {
+                progress.Fail(ex.Message);
+                Console.Error.WriteLine($"[total-recall] background re-index worker error: {ex.Message}");
+            }
+            finally { try { (wembedder as IDisposable)?.Dispose(); } catch { /* best-effort */ } }
+        }, ct);
+
+        return (progress, cts);
+    }
+
+    private static ServerCompositionHandles OpenSqlite(Core.Config.TotalRecallConfig cfg, string? dbPath, string storageMode = "sqlite", string querySource = "assistant")
+    {
+        var resolvedDbPath = dbPath ?? ConfigLoader.GetDbPath();
+        Directory.CreateDirectory(ConfigLoader.GetDataDir());
+        var dbParent = Path.GetDirectoryName(resolvedDbPath);
+        if (!string.IsNullOrEmpty(dbParent))
+        {
+            Directory.CreateDirectory(dbParent);
+        }
+
+        var conn = SqliteConnection.Open(resolvedDbPath);
+        try
+        {
+            MigrationRunner.RunMigrations(conn);
+
+            // Phase 3 idea 2c — tool-result cache (SQLite-backed, local only).
+            var toolCacheCfg = FSharpOption<Core.Config.ToolCacheConfig>.get_IsSome(cfg.ToolCache)
+                ? cfg.ToolCache.Value : null;
+            var toolCacheStore = new ToolCacheStore(
+                conn,
+                maxEntries: toolCacheCfg?.MaxEntries ?? 200,
+                defaultTtlSeconds: toolCacheCfg?.DefaultTtlSeconds ?? 600);
+
+            var store = new SqliteStore(conn);
+            var vec = new VectorSearch(conn);
+            var fts = new FtsSearch(conn);
+            var embedder = EmbedderFactory.CreateFromConfig(cfg.Embedding);
+            var onModelChange = ResolveOnModelChange(cfg);
+            var decision = EmbedderMigration.EnsureCompatibleSqlite(store, embedder, onModelChange, Console.Error);
+            var (reindexProgress, reindexCts) = MaybeStartBackgroundReindex(decision, resolvedDbPath, cfg.Embedding);
+            var hybrid = new HybridSearch(vec, fts, store);
+
+            var compactionLog = new CompactionLog(conn);
+            var importLog = new ImportLog(conn);
+
+            var index = new HierarchicalIndex(store, embedder, vec);
+            var validator = new IngestValidator(embedder, vec, store);
+            var fileIngester = new FileIngester(index, validator);
+
+            // Host importer set — mirrors ImportHostCommand.Execute.
+            var importers = new List<IImporter>
+            {
+                new ClaudeCodeImporter(store, embedder, vec, importLog),
+                new CopilotCliImporter(store, embedder, vec, importLog),
+                new CursorImporter(store, embedder, vec, importLog),
+                new ClineImporter(store, embedder, vec, importLog),
+                new OpenCodeImporter(store, embedder, vec, importLog),
+                new HermesImporter(store, embedder, vec, importLog),
+                new ProjectDocsImporter(fileIngester, index, importLog),
+            };
+
+            // Usage tracking wiring — Phase 1 registers Claude Code only.
+            // Phase 2 adds Copilot CLI. See token-usage-tracking spec §5.
+            var usageEventLog = new TotalRecall.Infrastructure.Telemetry.UsageEventLog(conn);
+            var usageWatermarks = new TotalRecall.Infrastructure.Telemetry.UsageWatermarkStore(conn);
+            var usageImporters = new List<TotalRecall.Infrastructure.Usage.IUsageImporter>
+            {
+                new TotalRecall.Infrastructure.Usage.ClaudeCodeUsageImporter(),
+                new TotalRecall.Infrastructure.Usage.CopilotCliUsageImporter(),
+            };
+            var usageRollup = new TotalRecall.Infrastructure.Telemetry.UsageDailyRollup(conn);
+            var usageIndexer = new TotalRecall.Infrastructure.Usage.UsageIndexer(
+                usageImporters, usageEventLog, usageWatermarks, rollup: usageRollup);
+
+            // Skill infrastructure — always wire in sqlite mode so locally-scanned
+            // skills are invokable via skill_get / skill_search without cortex.
+            var skillCache = new SqliteSkillCache(conn);
+            var localSkillSearch = new LocalSkillSearch(skillCache, embedder);
+            var skillScanner = new ClaudeCodeSkillScanner();
+            ICustomDirsSkillScanner? customDirsSkillScanner = null;
+            {
+                var extraDirs = Array.Empty<string>();
+                if (FSharpOption<Core.Config.SkillConfig>.get_IsSome(cfg.Skill)
+                    && FSharpOption<string[]>.get_IsSome(cfg.Skill.Value.ExtraDirs))
+                    extraDirs = cfg.Skill.Value.ExtraDirs.Value;
+                if (extraDirs.Length > 0)
+                    customDirsSkillScanner = new CustomDirsSkillScanner(extraDirs);
+            }
+            ISkillImportService sqliteSkillService = new SkillImportService(
+                skillScanner,
+                NullSkillClient.Instance,
+                customDirsScanner: customDirsSkillScanner,
+                cache: skillCache,
+                embedder: embedder);
+
+            // Task 13 — `usage_status` MCP tool. SQLite-only for now: the
+            // Postgres composition path has no usage indexer wired (Phase 2
+            // out-of-scope), so it correspondingly exposes no read tool.
+            // Constructed before SessionLifecycle so it can power
+            // lastSessionAge in session_start.
+            var usageQuery = new TotalRecall.Infrastructure.Usage.UsageQueryService(conn);
+
+            // Phase 5: retrieval telemetry — log locally in sqlite-only mode.
+            // syncQueue stays null because there is no cortex to push to.
+            // Constructed before SessionLifecycle so the delegate can be passed in.
+            var retrievalLog = new RetrievalEventLog(conn);
+
+            var sessionLifecycle = new SessionLifecycle(
+                importers, store, compactionLog,
+                usageIndexer: usageIndexer,
+                storageMode: storageMode,
+                skillImportService: sqliteSkillService,
+                tokenBudget: cfg.Tiers.Hot.TokenBudget,
+                maxEntries: cfg.Tiers.Hot.MaxEntries,
+                usageQuery: usageQuery,
+                embedder: embedder,
+                autoDemoteMinInjections: cfg.Compaction.AutoDemoteMinInjections,
+                taskWeight: cfg.Tiers.Hot.TaskWeight,
+                compactionHintThreshold: cfg.Tiers.Hot.CompactionHintThreshold,
+                retrievalStatsSince: retrievalLog.GetStatsSince,
+                cacheStats: toolCacheStore.GetSessionStats,
+                reindexProgress: reindexProgress,
+                binaryDir: AppContext.BaseDirectory,
+                projectScoping: ResolveProjectScoping(cfg),
+                hotMaxContentChars: cfg.Tiers.Hot.MaxContentChars,
+                vec: vec,
+                promoteMinAccess: cfg.Compaction.PromoteMinAccess,
+                promoteThreshold: cfg.Compaction.PromoteThreshold,
+                compactionConfig: cfg.Compaction);
+
+            var statusOptions = new StatusOptions(
+                DbPath: resolvedDbPath,
+                EmbeddingModel: cfg.Embedding.Model,
+                EmbeddingDimensions: cfg.Embedding.Dimensions);
+
+            var registry = BuildRegistry(
+                store, vec, embedder, hybrid,
+                fileIngester, compactionLog, sessionLifecycle, statusOptions,
+                scopeDefault: ResolveScopeDefault(cfg),
+                retrievalLog: retrievalLog,
+                compactionLogWriter: compactionLog,
+                syncBacklog: new Infrastructure.Sync.SyncBacklogReader(conn),
+                pinnedMaxChars: ResolvePinnedMaxChars(cfg),
+                hotMaxChars: cfg.Tiers.Hot.MaxContentChars,
+                reindexProgress: reindexProgress,
+                querySource: querySource);
+
+            registry.Register(new UsageStatusHandler(usageQuery));
+
+            // Phase 3 idea 2c — cache handlers are SQLite/cortex-only (the
+            // cache table lives in the local DB), same pattern as usage_status.
+            registry.Register(new CacheCheckHandler(toolCacheStore));
+            registry.Register(new CacheStoreHandler(toolCacheStore));
+
+            // Skill MCP handlers — sqlite mode: cache-backed, no cortex client.
+            // Use NullSkillClient as the fallback so any cache miss returns null
+            // / empty (instead of throwing) without a network roundtrip.
+            registry.Register(new SkillSearchHandler(localSkillSearch, NullSkillClient.Instance));
+            registry.Register(new SkillGetHandler(skillCache, NullSkillClient.Instance));
+            registry.Register(new SkillListHandler(NullSkillClient.Instance));
+            registry.Register(new SkillImportHostHandler(
+                sqliteSkillService, () => Environment.CurrentDirectory));
+
+            return new ServerCompositionHandles(conn, registry, store, storageMode, reindexProgress: reindexProgress, reindexCts: reindexCts);
+        }
+        catch
+        {
+            try { conn.Dispose(); } catch { /* best-effort */ }
+            throw;
+        }
+    }
+
+    private static ServerCompositionHandles OpenPostgres(Core.Config.TotalRecallConfig cfg, string storageMode = "postgres", string querySource = "assistant")
+    {
+        if (!FSharpOption<Core.Config.StorageConfig>.get_IsSome(cfg.Storage)
+            || !FSharpOption<string>.get_IsSome(cfg.Storage.Value.ConnectionString))
+        {
+            throw new InvalidOperationException(
+                "Storage mode is \"postgres\" but no connection string is configured. " +
+                "Set 'connection_string' in [storage], or set TOTAL_RECALL_PG_CONNECTION_STRING.");
+        }
+
+        var connStr = cfg.Storage.Value.ConnectionString.Value;
+        var userId = ResolveUserId(cfg);
+        var dims = cfg.Embedding.Dimensions;
+
+        var dsBuilder = new NpgsqlDataSourceBuilder(connStr);
+        dsBuilder.UseVector();
+        var dataSource = dsBuilder.Build();
+        try
+        {
+            PostgresMigrationRunner.RunMigrations(dataSource, dims);
+
+            var store = new PostgresStore(dataSource, userId, cfg.Tiers.Hot.MaxEntries);
+            var vec = new PgvectorSearch(dataSource, userId);
+            var fts = new PostgresFtsSearch(dataSource, userId);
+            var embedder = EmbedderFactory.CreateFromConfig(cfg.Embedding);
+            var onModelChange = ResolveOnModelChange(cfg);
+            // postgres has no background-reindex path; Warned/Compatible both mean "proceed", Auto/Block throw.
+            _ = EmbedderMigration.EnsureCompatiblePostgres(store, embedder, onModelChange, Console.Error);
+            var hybrid = new HybridSearch(vec, fts, store);
+
+            var compactionLog = new PostgresCompactionLog(dataSource);
+            var importLog = new PostgresImportLog(dataSource);
+
+            var index = new HierarchicalIndex(store, embedder, vec);
+            var validator = new IngestValidator(embedder, vec, store);
+            var fileIngester = new FileIngester(index, validator);
+
+            var importers = new List<IImporter>
+            {
+                new ClaudeCodeImporter(store, embedder, vec, importLog),
+                new CopilotCliImporter(store, embedder, vec, importLog),
+                new CursorImporter(store, embedder, vec, importLog),
+                new ClineImporter(store, embedder, vec, importLog),
+                new OpenCodeImporter(store, embedder, vec, importLog),
+                new HermesImporter(store, embedder, vec, importLog),
+                new ProjectDocsImporter(fileIngester, index, importLog),
+            };
+
+            var sessionLifecycle = new SessionLifecycle(importers, store, compactionLog,
+                storageMode: storageMode,
+                tokenBudget: cfg.Tiers.Hot.TokenBudget,
+                maxEntries: cfg.Tiers.Hot.MaxEntries,
+                embedder: embedder,
+                autoDemoteMinInjections: cfg.Compaction.AutoDemoteMinInjections,
+                taskWeight: cfg.Tiers.Hot.TaskWeight,
+                binaryDir: AppContext.BaseDirectory, // reindex stays null — postgres has no local background reindex
+                projectScoping: ResolveProjectScoping(cfg),
+                vec: vec,
+                promoteMinAccess: cfg.Compaction.PromoteMinAccess,
+                promoteThreshold: cfg.Compaction.PromoteThreshold,
+                compactionConfig: cfg.Compaction);
+
+            var statusOptions = new StatusOptions(
+                DbPath: connStr,
+                EmbeddingModel: cfg.Embedding.Model,
+                EmbeddingDimensions: dims);
+
+            var registry = BuildRegistry(
+                store, vec, embedder, hybrid,
+                fileIngester, compactionLog, sessionLifecycle, statusOptions,
+                scopeDefault: ResolveScopeDefault(cfg),
+                pinnedMaxChars: ResolvePinnedMaxChars(cfg),
+                hotMaxChars: cfg.Tiers.Hot.MaxContentChars,
+                querySource: querySource);
+
+            return new ServerCompositionHandles(dataSource, registry, store, storageMode);
+        }
+        catch
+        {
+            try { dataSource.Dispose(); } catch { }
+            throw;
+        }
+    }
+
+    private static ServerCompositionHandles OpenCortex(Core.Config.TotalRecallConfig cfg, string? dbPath, string storageMode = "cortex", string querySource = "assistant")
+    {
+        // Cortex mode uses SQLite locally, plus a RoutingStore that enqueues
+        // writes for eventual push to the remote Cortex backend.
+        var resolvedDbPath = dbPath ?? ConfigLoader.GetDbPath();
+        Directory.CreateDirectory(ConfigLoader.GetDataDir());
+        var dbParent = Path.GetDirectoryName(resolvedDbPath);
+        if (!string.IsNullOrEmpty(dbParent))
+        {
+            Directory.CreateDirectory(dbParent);
+        }
+
+        if (!FSharpOption<Core.Config.CortexConfig>.get_IsSome(cfg.Cortex))
+        {
+            throw new InvalidOperationException(
+                "Storage mode is \"cortex\" but the [cortex] config section is missing or incomplete. " +
+                "Provide both 'url' and 'pat' in [cortex], or set TOTAL_RECALL_CORTEX_URL and TOTAL_RECALL_CORTEX_PAT.");
+        }
+
+        var cortexUrl = cfg.Cortex.Value.Url;
+        var cortexPat = cfg.Cortex.Value.Pat;
+
+        return OpenCortexCore(cfg, resolvedDbPath, cortexUrl, cortexPat, storageMode, querySource);
+    }
+
+    /// <summary>
+    /// Test-friendly entry point for cortex mode that takes explicit parameters
+    /// instead of requiring config files.
+    /// </summary>
+    public static ServerCompositionHandles OpenCortexForTest(
+        string sqliteDbPath, string cortexUrl, string cortexPat)
+    {
+        var cfg = new ConfigLoader().LoadEffectiveConfig();
+        return OpenCortexCore(cfg, sqliteDbPath, cortexUrl, cortexPat, "cortex");
+    }
+
+    private static ServerCompositionHandles OpenCortexCore(
+        Core.Config.TotalRecallConfig cfg, string resolvedDbPath,
+        string cortexUrl, string cortexPat, string storageMode = "cortex", string querySource = "assistant")
+    {
+        var conn = SqliteConnection.Open(resolvedDbPath);
+        try
+        {
+            MigrationRunner.RunMigrations(conn);
+
+            // Phase 3 idea 2c — tool-result cache (SQLite-backed, local only).
+            var toolCacheCfgCortex = FSharpOption<Core.Config.ToolCacheConfig>.get_IsSome(cfg.ToolCache)
+                ? cfg.ToolCache.Value : null;
+            var toolCacheStore = new ToolCacheStore(
+                conn,
+                maxEntries: toolCacheCfgCortex?.MaxEntries ?? 200,
+                defaultTtlSeconds: toolCacheCfgCortex?.DefaultTtlSeconds ?? 600);
+
+            var localStore = new SqliteStore(conn);
+            var vec = new VectorSearch(conn);
+            var fts = new FtsSearch(conn);
+            var embedder = EmbedderFactory.CreateFromConfig(cfg.Embedding);
+
+            // Cortex auto-migrates its LOCAL vec0 index here, exactly like the
+            // sqlite path (cortex stores locally in SQLite). The remote re-embeds
+            // independently via content-only sync, so this only governs the local
+            // index. Without this, a cortex DB was never fingerprint-stamped, so a
+            // model swap left it unstamped-but-populated with stale local vectors.
+            var onModelChange = ResolveOnModelChange(cfg);
+            var decision = EmbedderMigration.EnsureCompatibleSqlite(localStore, embedder, onModelChange, Console.Error);
+            var (reindexProgress, reindexCts) = MaybeStartBackgroundReindex(decision, resolvedDbPath, cfg.Embedding);
+
+            var hybrid = new HybridSearch(vec, fts, localStore);
+
+            var cortexClient = CortexClient.Create(cortexUrl, cortexPat);
+            var syncQueue = new SyncQueue(conn);
+            var routingStore = new RoutingStore(localStore, cortexClient, syncQueue);
+            var skillCache = new SqliteSkillCache(conn);
+            var localSkillSearch = new LocalSkillSearch(skillCache, embedder);
+            var syncService = new Infrastructure.Sync.SyncService(
+                localStore, cortexClient, syncQueue, conn, skillCache);
+
+            var syncIntervalSeconds = FSharpOption<Core.Config.CortexConfig>.get_IsSome(cfg.Cortex)
+                && FSharpOption<int>.get_IsSome(cfg.Cortex.Value.SyncIntervalSeconds)
+                ? cfg.Cortex.Value.SyncIntervalSeconds.Value
+                : 300;
+
+            Infrastructure.Sync.PeriodicSync? periodicSync = syncIntervalSeconds > 0
+                ? new Infrastructure.Sync.PeriodicSync(syncService, syncIntervalSeconds)
+                : null;
+
+            var compactionLog = new CompactionLog(conn);
+            var importLog = new ImportLog(conn);
+
+            var index = new HierarchicalIndex(routingStore, embedder, vec);
+            var validator = new IngestValidator(embedder, vec, routingStore);
+            var fileIngester = new FileIngester(index, validator);
+
+            var importers = new List<IImporter>
+            {
+                new ClaudeCodeImporter(routingStore, embedder, vec, importLog),
+                new CopilotCliImporter(routingStore, embedder, vec, importLog),
+                new CursorImporter(routingStore, embedder, vec, importLog),
+                new ClineImporter(routingStore, embedder, vec, importLog),
+                new OpenCodeImporter(routingStore, embedder, vec, importLog),
+                new HermesImporter(routingStore, embedder, vec, importLog),
+                new ProjectDocsImporter(fileIngester, index, importLog),
+            };
+
+            var usageEventLog = new TotalRecall.Infrastructure.Telemetry.UsageEventLog(conn);
+            var usageWatermarks = new TotalRecall.Infrastructure.Telemetry.UsageWatermarkStore(conn);
+            var usageImporters = new List<TotalRecall.Infrastructure.Usage.IUsageImporter>
+            {
+                new TotalRecall.Infrastructure.Usage.ClaudeCodeUsageImporter(),
+                new TotalRecall.Infrastructure.Usage.CopilotCliUsageImporter(),
+            };
+            var usageRollup = new TotalRecall.Infrastructure.Telemetry.UsageDailyRollup(conn);
+            var usageIndexer = new TotalRecall.Infrastructure.Usage.UsageIndexer(
+                usageImporters, usageEventLog, usageWatermarks,
+                rollup: usageRollup,
+                syncQueue: syncQueue);
+
+            // Plan 2: skill infrastructure — cortex-mode only. Scanner walks
+            // local ~/.claude/skills and {project}/.claude/skills; when
+            // auto-import is enabled the client POSTs bundles to the cortex
+            // /api/me/skills/import endpoint; the import service orchestrates
+            // both and is injected into SessionLifecycle so session_start
+            // folds skill counts into importSummary.
+            //
+            // Auto-import defaults to DISABLED: without [skills] (or legacy
+            // [skill]) auto_import = true, uploading every locally-scanned
+            // skill duplicates whatever a host tool (e.g. a Cortex skill-sync
+            // plugin) already synced down globally — this is opt-in, not the
+            // safe default.
+            var autoImportEnabled = false;
+            var extraSkillDirs = Array.Empty<string>();
+            if (FSharpOption<Core.Config.SkillConfig>.get_IsSome(cfg.Skill))
+            {
+                var skillCfg = cfg.Skill.Value;
+                if (FSharpOption<string[]>.get_IsSome(skillCfg.ExtraDirs))
+                {
+                    extraSkillDirs = skillCfg.ExtraDirs.Value;
+                }
+                if (FSharpOption<bool>.get_IsSome(skillCfg.AutoImport))
+                {
+                    autoImportEnabled = skillCfg.AutoImport.Value;
+                }
+            }
+            ISkillClient skillClient = autoImportEnabled
+                ? CortexSkillClient.Create(cortexUrl, cortexPat)
+                : NullSkillClient.Instance;
+            var skillScanner = new ClaudeCodeSkillScanner();
+            ICustomDirsSkillScanner? customDirsScanner = extraSkillDirs.Length > 0
+                ? new CustomDirsSkillScanner(extraSkillDirs)
+                : null;
+            var skillImportService = new SkillImportService(
+                skillScanner, skillClient,
+                customDirsScanner: customDirsScanner,
+                cache: skillCache,
+                embedder: embedder);
+
+            var usageQuery = new TotalRecall.Infrastructure.Usage.UsageQueryService(conn);
+
+            // Phase 5: retrieval telemetry — log locally AND enqueue for
+            // push in cortex mode so SyncService.FlushAsync picks it up.
+            // Constructed before SessionLifecycle so the delegate can be passed in.
+            var retrievalLog = new RetrievalEventLog(conn);
+
+            var sessionLifecycle = new SessionLifecycle(
+                importers, routingStore, compactionLog,
+                usageIndexer: usageIndexer,
+                storageMode: storageMode,
+                skillImportService: skillImportService,
+                tokenBudget: cfg.Tiers.Hot.TokenBudget,
+                maxEntries: cfg.Tiers.Hot.MaxEntries,
+                usageQuery: usageQuery,
+                embedder: embedder,
+                autoDemoteMinInjections: cfg.Compaction.AutoDemoteMinInjections,
+                taskWeight: cfg.Tiers.Hot.TaskWeight,
+                retrievalStatsSince: retrievalLog.GetStatsSince,
+                cacheStats: toolCacheStore.GetSessionStats,
+                reindexProgress: reindexProgress,
+                binaryDir: AppContext.BaseDirectory,
+                projectScoping: ResolveProjectScoping(cfg),
+                hotMaxContentChars: cfg.Tiers.Hot.MaxContentChars,
+                vec: vec,
+                promoteMinAccess: cfg.Compaction.PromoteMinAccess,
+                promoteThreshold: cfg.Compaction.PromoteThreshold,
+                compactionConfig: cfg.Compaction);
+
+            var statusOptions = new StatusOptions(
+                DbPath: resolvedDbPath,
+                EmbeddingModel: cfg.Embedding.Model,
+                EmbeddingDimensions: cfg.Embedding.Dimensions);
+
+            var registry = BuildRegistry(
+                routingStore, vec, embedder, hybrid,
+                fileIngester, compactionLog, sessionLifecycle, statusOptions,
+                syncService: syncService, remoteBackend: cortexClient,
+                periodicSync: periodicSync,
+                scopeDefault: ResolveScopeDefault(cfg),
+                retrievalLog: retrievalLog,
+                syncQueue: syncQueue,
+                compactionLogWriter: compactionLog,
+                syncBacklog: new Infrastructure.Sync.SyncBacklogReader(conn),
+                pinnedMaxChars: ResolvePinnedMaxChars(cfg),
+                hotMaxChars: cfg.Tiers.Hot.MaxContentChars,
+                reindexProgress: reindexProgress,
+                querySource: querySource);
+
+            registry.Register(new UsageStatusHandler(usageQuery));
+
+            // Phase 3 idea 2c — cache handlers are SQLite/cortex-only (the
+            // cache table lives in the local DB), same pattern as usage_status.
+            registry.Register(new CacheCheckHandler(toolCacheStore));
+            registry.Register(new CacheStoreHandler(toolCacheStore));
+
+            // Plan 2: skill_* MCP handlers — cortex-mode: cache-first, cortex fallback.
+            registry.Register(new SkillSearchHandler(localSkillSearch, skillClient));
+            registry.Register(new SkillGetHandler(skillCache, skillClient));
+            registry.Register(new SkillListHandler(skillClient));
+            registry.Register(new SkillDeleteHandler(skillClient));
+            registry.Register(new SkillImportHostHandler(
+                skillImportService, () => Environment.CurrentDirectory));
+
+            return new ServerCompositionHandles(conn, registry, routingStore, storageMode, periodicSync, reindexProgress, reindexCts, skillAutoImportEnabled: autoImportEnabled);
+        }
+        catch
+        {
+            try { conn.Dispose(); } catch { /* best-effort */ }
+            throw;
+        }
+    }
+
+    private static string ResolveUserId(Core.Config.TotalRecallConfig cfg)
+    {
+        if (FSharpOption<Core.Config.UserConfig>.get_IsSome(cfg.User)
+            && FSharpOption<string>.get_IsSome(cfg.User.Value.UserId))
+            return cfg.User.Value.UserId.Value;
+        var envUserId = Environment.GetEnvironmentVariable("TOTAL_RECALL_USER_ID");
+        return envUserId ?? "local";
+    }
+
+    /// <summary>
+    /// Resolves the configured scope default from <c>[scope] default</c> in
+    /// the TOML config. Returns <c>null</c> when the section or key is absent.
+    /// </summary>
+    private static string? ResolveScopeDefault(Core.Config.TotalRecallConfig cfg)
+    {
+        if (!FSharpOption<Core.Config.ScopeConfig>.get_IsSome(cfg.Scope))
+            return null;
+        var scopeCfg = cfg.Scope.Value;
+        if (!FSharpOption<string>.get_IsSome(scopeCfg.Default))
+            return null;
+        return scopeCfg.Default.Value;
+    }
+
+    /// <summary>
+    /// Resolves the effective pinned content character limit from
+    /// <c>[tiers.pinned] max_content_chars</c>. Falls back to
+    /// <see cref="PinnedTierLimits.DefaultMaxContentChars"/> (500) when the
+    /// section is absent, matching the <c>Pinned: option</c> design in Config.fs.
+    /// </summary>
+    private static int ResolvePinnedMaxChars(Core.Config.TotalRecallConfig cfg) =>
+        FSharpOption<Core.Config.PinnedTierConfig>.get_IsSome(cfg.Tiers.Pinned)
+            ? cfg.Tiers.Pinned.Value.MaxContentChars
+            : PinnedTierLimits.DefaultMaxContentChars;
+
+    /// <summary>
+    /// Resolves the effective project-scoping flag from
+    /// <c>[tiers.pinned] project_scoping</c>. Defaults to <c>true</c> when the
+    /// section is absent, matching the <c>Pinned: option</c> design in Config.fs.
+    /// </summary>
+    private static bool ResolveProjectScoping(Core.Config.TotalRecallConfig cfg) =>
+        FSharpOption<Core.Config.PinnedTierConfig>.get_IsSome(cfg.Tiers.Pinned)
+            ? cfg.Tiers.Pinned.Value.ProjectScoping
+            : true;
+}

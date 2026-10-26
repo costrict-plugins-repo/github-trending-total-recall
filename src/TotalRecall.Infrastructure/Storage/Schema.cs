@@ -1,0 +1,874 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using TotalRecall.Core;
+using MsSqliteConnection = Microsoft.Data.Sqlite.SqliteConnection;
+
+namespace TotalRecall.Infrastructure.Storage;
+
+/// <summary>
+/// Schema migration runner. Ports <c>src-ts/db/schema.ts</c> — a 3-migration
+/// initial schema consisting of:
+///   1. Content tables (hot/warm/cold × memory/knowledge = 6) + vec0 virtual
+///      tables + per-table indexes + system tables + system indexes.
+///   2. <c>_meta</c> key-value store + <c>benchmark_candidates</c>.
+///   3. FTS5 virtual tables + sync triggers + backfill.
+///
+/// Version tracking lives in the <c>_schema_version</c> table. Running
+/// <see cref="RunMigrations"/> twice is idempotent: already-applied migrations
+/// are skipped based on <c>MAX(version)</c>.
+///
+/// WAL and <c>foreign_keys</c> pragmas are deliberately NOT applied here —
+/// <see cref="SqliteConnection.Open"/> already sets them and SQLite disallows
+/// changing them inside a transaction anyway.
+/// </summary>
+public static class MigrationRunner
+{
+    /// <summary>
+    /// Fingerprint written to <c>_meta</c> on fresh-init schema migration so
+    /// <see cref="AutoMigrationGuard"/> can distinguish a brand-new .NET-native
+    /// DB from an unmigrated legacy TS DB (both have identical schemas — the
+    /// marker is the only positive signal). See Plan 7 Task 7.-1.
+    /// </summary>
+    public const string MigrationCompleteMarkerKey = "migration_from_ts_complete";
+
+    /// <summary>
+    /// Returns the canonical content-table name for the given
+    /// <see cref="Tier"/> / <see cref="ContentType"/> pair. Mirrors
+    /// <c>tableName()</c> in <c>src-ts/types.ts</c>.
+    /// </summary>
+    internal static string TableName(Tier tier, ContentType type)
+    {
+        string tierStr;
+        if (tier.IsHot) tierStr = "hot";
+        else if (tier.IsWarm) tierStr = "warm";
+        else if (tier.IsCold) tierStr = "cold";
+        else throw new ArgumentOutOfRangeException(nameof(tier));
+
+        string typeStr;
+        if (type.IsMemory) typeStr = "memories";
+        else if (type.IsKnowledge) typeStr = "knowledge";
+        else throw new ArgumentOutOfRangeException(nameof(type));
+
+        return $"{tierStr}_{typeStr}";
+    }
+
+    internal static string VecTableName(Tier tier, ContentType type) =>
+        $"{TableName(tier, type)}_vec";
+
+    internal static string FtsTableName(Tier tier, ContentType type) =>
+        $"{TableName(tier, type)}_fts";
+
+    /// <summary>All 6 (tier, type) pairs the schema creates tables for.
+    /// DO NOT extend: historical migrations 1, 3, 5, 8, 9, 14 iterate this
+    /// array and altering it would change what those already-applied
+    /// migrations create on fresh databases. Pinned tables are created by
+    /// Migration 16 with the full current column set instead.</summary>
+    internal static readonly (Tier Tier, ContentType Type)[] AllTablePairs =
+    {
+        (Tier.Hot,  ContentType.Memory),
+        (Tier.Warm, ContentType.Memory),
+        (Tier.Cold, ContentType.Memory),
+        (Tier.Hot,  ContentType.Knowledge),
+        (Tier.Warm, ContentType.Knowledge),
+        (Tier.Cold, ContentType.Knowledge),
+    };
+
+    /// <summary>The 2 pinned content-table base names, created by Migration 16.
+    /// Kept separate from <see cref="AllTablePairs"/> so historical migrations
+    /// are not affected. Tier model v2 (Task 9): these are hard-coded string
+    /// literals — the <c>Tier.Pinned</c> DU case has been retired, but
+    /// Migration 16 must keep creating these tables on DBs below v16 (Task 6's
+    /// app-layer <c>RunOnce</c> later drops them after moving the rows).</summary>
+    internal static readonly string[] PinnedContentTables =
+    {
+        "pinned_memories",
+        "pinned_knowledge",
+    };
+
+    private const string SchemaVersionDdl = """
+        CREATE TABLE IF NOT EXISTS _schema_version (
+            version    INTEGER NOT NULL,
+            applied_at INTEGER NOT NULL
+        )
+        """;
+
+    private static string ContentTableDdl(string name) => $$"""
+        CREATE TABLE IF NOT EXISTS {{name}} (
+            id                TEXT PRIMARY KEY NOT NULL,
+            content           TEXT NOT NULL,
+            summary           TEXT,
+            source            TEXT,
+            source_tool       TEXT,
+            project           TEXT,
+            tags              TEXT DEFAULT '[]',
+            created_at        INTEGER NOT NULL,
+            updated_at        INTEGER NOT NULL,
+            last_accessed_at  INTEGER NOT NULL,
+            access_count      INTEGER DEFAULT 0,
+            decay_score       REAL DEFAULT 1.0,
+            parent_id         TEXT,
+            collection_id     TEXT,
+            metadata          TEXT DEFAULT '{}'
+        )
+        """;
+
+    // Note: the scope index (idx_<name>_scope) is intentionally excluded here —
+    // it was added via Migration 8 for the original 6 tables; Migration 16 appends it inline for pinned tables.
+    private static string[] ContentTableIndexes(string name) => new[]
+    {
+        $"CREATE INDEX IF NOT EXISTS idx_{name}_project       ON {name}(project)",
+        $"CREATE INDEX IF NOT EXISTS idx_{name}_decay_score   ON {name}(decay_score)",
+        $"CREATE INDEX IF NOT EXISTS idx_{name}_last_accessed ON {name}(last_accessed_at)",
+        $"CREATE INDEX IF NOT EXISTS idx_{name}_parent_id     ON {name}(parent_id)",
+        $"CREATE INDEX IF NOT EXISTS idx_{name}_collection_id ON {name}(collection_id)",
+    };
+
+    private static readonly string[] SystemTableDdls =
+    {
+        """
+        CREATE TABLE IF NOT EXISTS retrieval_events (
+            id                       TEXT PRIMARY KEY NOT NULL,
+            timestamp                INTEGER NOT NULL,
+            session_id               TEXT NOT NULL,
+            query_text               TEXT NOT NULL,
+            query_source             TEXT NOT NULL,
+            query_embedding          BLOB,
+            results                  TEXT NOT NULL DEFAULT '[]',
+            result_count             INTEGER NOT NULL DEFAULT 0,
+            top_score                REAL,
+            top_tier                 TEXT,
+            top_content_type         TEXT,
+            outcome_used             INTEGER,
+            outcome_signal           TEXT,
+            config_snapshot_id       TEXT NOT NULL,
+            latency_ms               INTEGER,
+            tiers_searched           TEXT NOT NULL DEFAULT '[]',
+            total_candidates_scanned INTEGER
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS compaction_log (
+            id                  TEXT PRIMARY KEY NOT NULL,
+            timestamp           INTEGER NOT NULL,
+            session_id          TEXT,
+            source_tier         TEXT NOT NULL,
+            target_tier         TEXT,
+            source_entry_ids    TEXT NOT NULL DEFAULT '[]',
+            target_entry_id     TEXT,
+            semantic_drift      REAL,
+            facts_preserved     INTEGER,
+            facts_in_original   INTEGER,
+            preservation_ratio  REAL,
+            decay_scores        TEXT NOT NULL DEFAULT '[]',
+            reason              TEXT NOT NULL,
+            config_snapshot_id  TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS config_snapshots (
+            id        TEXT PRIMARY KEY NOT NULL,
+            name      TEXT,
+            timestamp INTEGER NOT NULL,
+            config    TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS import_log (
+            id              TEXT PRIMARY KEY NOT NULL,
+            timestamp       INTEGER NOT NULL,
+            source_tool     TEXT NOT NULL,
+            source_path     TEXT NOT NULL,
+            content_hash    TEXT NOT NULL,
+            target_entry_id TEXT NOT NULL,
+            target_tier     TEXT NOT NULL,
+            target_type     TEXT NOT NULL
+        )
+        """,
+    };
+
+    private static readonly string[] SystemTableIndexes =
+    {
+        "CREATE INDEX IF NOT EXISTS idx_retrieval_events_timestamp  ON retrieval_events(timestamp)",
+        "CREATE INDEX IF NOT EXISTS idx_retrieval_events_session_id ON retrieval_events(session_id)",
+        "CREATE INDEX IF NOT EXISTS idx_compaction_log_timestamp    ON compaction_log(timestamp)",
+        "CREATE INDEX IF NOT EXISTS idx_compaction_log_source_tier  ON compaction_log(source_tier)",
+        "CREATE INDEX IF NOT EXISTS idx_import_log_content_hash     ON import_log(content_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_import_log_source_tool      ON import_log(source_tool)",
+    };
+
+    /// <summary>
+    /// Ordered list of migrations. Each entry is run inside the outer
+    /// transaction opened by <see cref="RunMigrations"/>. To add a new
+    /// migration, append to this list — never reorder or remove.
+    /// </summary>
+    private static readonly Action<MsSqliteConnection, Microsoft.Data.Sqlite.SqliteTransaction>[] Migrations =
+    {
+        // Migration 1: content tables + vec0 + system tables + indexes
+        Migration1_InitialSchema,
+        // Migration 2: _meta + benchmark_candidates
+        Migration2_MetaAndBenchmark,
+        // Migration 3: FTS5 virtual tables + triggers + backfill
+        Migration3_Fts5,
+        // Migration 4: compaction_log.source column (history tagging)
+        Migration4_CompactionLogSource,
+        // Migration 5: orphan vec/content row cleanup (0.6.7 hot-fix)
+        Migration5_CleanupOrphans,
+        // Migration 6: usage telemetry tables (usage_events, usage_daily, usage_watermarks)
+        Migration6_UsageTelemetry,
+        // Migration 7: persistent sync queue for outbound Cortex buffering
+        Migration7_SyncQueue,
+        // Migration 8: first-class scope column on all content tables
+        Migration8_Scope,
+        // Migration 9: entry_type column on all content tables
+        Migration9_EntryType,
+        // Migration 10: skill_cache table for local skill metadata sync
+        Migration10_SkillCache,
+        // Migration 11: sync_queue.next_attempt_at column for exponential backoff retry
+        Migration11_SyncQueueBackoff,
+        // Migration 12: skill_cache content + frontmatter + content_hash + content_embedding + embedder_fingerprint + natural-key unique index
+        Migration12_SkillCacheContentAndEmbedding,
+        // Migration 13: skill usage counter columns + skill_usage_events table
+        Migration13_SkillUsage,
+        // Migration 14: times_injected column on all 6 content tables (Phase 2 idea 1c)
+        Migration14_TimesInjected,
+        // Migration 15: tool_cache table (Phase 3 idea 2c)
+        Migration15_ToolCache,
+        // Migration 16: pinned tier content tables (pinned_memories, pinned_knowledge)
+        Migration16_PinnedTier,
+        // Migration 17: add sticky column to hot content tables (tier model v2)
+        Migration17_HotStickyColumn,
+    };
+
+    /// <summary>
+    /// Apply any pending migrations to <paramref name="conn"/>. Idempotent:
+    /// safe to call repeatedly on an already-migrated database.
+    /// </summary>
+    public static void RunMigrations(MsSqliteConnection conn)
+    {
+        ArgumentNullException.ThrowIfNull(conn);
+
+        using var tx = conn.BeginTransaction();
+
+        Exec(conn, tx, SchemaVersionDdl);
+        var startingVersion = GetCurrentVersion(conn, tx);
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        for (var i = startingVersion; i < Migrations.Length; i++)
+        {
+            Migrations[i](conn, tx);
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = "INSERT INTO _schema_version (version, applied_at) VALUES ($v, $t)";
+            cmd.Parameters.AddWithValue("$v", i + 1);
+            cmd.Parameters.AddWithValue("$t", now);
+            cmd.ExecuteNonQuery();
+        }
+
+        // Fresh-init fingerprint. When this call created the schema from nothing
+        // (startingVersion == 0), stamp _meta with the migration-complete marker
+        // so AutoMigrationGuard can distinguish this brand-new .NET DB from an
+        // unmigrated TS DB on subsequent startups. Without this, the guard would
+        // false-positive on fresh .NET installs. DBs being upgraded from an
+        // earlier .NET schema version are left untouched.
+        if (startingVersion == 0)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText =
+                "INSERT INTO _meta (key, value) VALUES ($k, $v) " +
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+            cmd.Parameters.AddWithValue("$k", MigrationCompleteMarkerKey);
+            cmd.Parameters.AddWithValue(
+                "$v",
+                DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString(System.Globalization.CultureInfo.InvariantCulture));
+            cmd.ExecuteNonQuery();
+        }
+
+        tx.Commit();
+    }
+
+    /// Caller MUST ensure <c>_schema_version</c> exists first (see <see cref="RunMigrations"/>).
+    private static int GetCurrentVersion(
+        MsSqliteConnection conn,
+        Microsoft.Data.Sqlite.SqliteTransaction tx)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "SELECT COALESCE(MAX(version), 0) FROM _schema_version";
+        var result = cmd.ExecuteScalar();
+        return result is long l ? (int)l : 0;
+    }
+
+    // --- migrations -------------------------------------------------------
+
+    private static void Migration1_InitialSchema(
+        MsSqliteConnection conn,
+        Microsoft.Data.Sqlite.SqliteTransaction tx)
+    {
+        foreach (var (tier, type) in AllTablePairs)
+        {
+            var tbl = TableName(tier, type);
+            var vecTbl = VecTableName(tier, type);
+
+            Exec(conn, tx, ContentTableDdl(tbl));
+            Exec(conn, tx,
+                $"CREATE VIRTUAL TABLE IF NOT EXISTS {vecTbl} USING vec0(embedding float[384])");
+
+            foreach (var idx in ContentTableIndexes(tbl))
+                Exec(conn, tx, idx);
+        }
+
+        foreach (var ddl in SystemTableDdls)
+            Exec(conn, tx, ddl);
+
+        foreach (var idx in SystemTableIndexes)
+            Exec(conn, tx, idx);
+    }
+
+    private static void Migration2_MetaAndBenchmark(
+        MsSqliteConnection conn,
+        Microsoft.Data.Sqlite.SqliteTransaction tx)
+    {
+        Exec(conn, tx, """
+            CREATE TABLE IF NOT EXISTS _meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """);
+
+        Exec(conn, tx, """
+            CREATE TABLE IF NOT EXISTS benchmark_candidates (
+                id                  TEXT PRIMARY KEY,
+                query_text          TEXT NOT NULL UNIQUE,
+                top_score           REAL NOT NULL,
+                top_result_content  TEXT,
+                top_result_entry_id TEXT,
+                first_seen          INTEGER NOT NULL,
+                last_seen           INTEGER NOT NULL,
+                times_seen          INTEGER DEFAULT 1,
+                status              TEXT DEFAULT 'pending'
+            )
+            """);
+
+        Exec(conn, tx,
+            "CREATE INDEX IF NOT EXISTS idx_benchmark_candidates_status ON benchmark_candidates(status)");
+    }
+
+    private static void Migration3_Fts5(
+        MsSqliteConnection conn,
+        Microsoft.Data.Sqlite.SqliteTransaction tx)
+    {
+        foreach (var (tier, type) in AllTablePairs)
+        {
+            var tbl = TableName(tier, type);
+            var ftsTbl = FtsTableName(tier, type);
+
+            Exec(conn, tx,
+                $"CREATE VIRTUAL TABLE IF NOT EXISTS {ftsTbl} USING fts5(content, tags, content={tbl}, content_rowid=rowid)");
+
+            Exec(conn, tx, $$"""
+                CREATE TRIGGER IF NOT EXISTS {{tbl}}_fts_ai AFTER INSERT ON {{tbl}} BEGIN
+                    INSERT INTO {{ftsTbl}}(rowid, content, tags) VALUES (new.rowid, new.content, new.tags);
+                END
+                """);
+
+            Exec(conn, tx, $$"""
+                CREATE TRIGGER IF NOT EXISTS {{tbl}}_fts_ad AFTER DELETE ON {{tbl}} BEGIN
+                    INSERT INTO {{ftsTbl}}({{ftsTbl}}, rowid, content, tags) VALUES('delete', old.rowid, old.content, old.tags);
+                END
+                """);
+
+            Exec(conn, tx, $$"""
+                CREATE TRIGGER IF NOT EXISTS {{tbl}}_fts_au AFTER UPDATE ON {{tbl}} BEGIN
+                    INSERT INTO {{ftsTbl}}({{ftsTbl}}, rowid, content, tags) VALUES('delete', old.rowid, old.content, old.tags);
+                    INSERT INTO {{ftsTbl}}(rowid, content, tags) VALUES (new.rowid, new.content, new.tags);
+                END
+                """);
+
+            // Backfill any existing rows (no-op on a fresh DB).
+            Exec(conn, tx,
+                $"INSERT INTO {ftsTbl}(rowid, content, tags) SELECT rowid, content, tags FROM {tbl}");
+        }
+    }
+
+    /// <summary>
+    /// Migration 4 — add a <c>source</c> column to <c>compaction_log</c> so
+    /// the history log can distinguish compaction-driven tier movements
+    /// (source = <c>'compaction'</c>) from manual ones (<c>'api'</c>,
+    /// <c>'import'</c>, etc.). The column is <c>NOT NULL DEFAULT
+    /// 'compaction'</c> so pre-v4 rows are backfilled to the semantically
+    /// correct value automatically and existing insert sites that haven't
+    /// been updated to pass a source keep producing valid rows.
+    /// </summary>
+    private static void Migration4_CompactionLogSource(
+        MsSqliteConnection conn,
+        Microsoft.Data.Sqlite.SqliteTransaction tx)
+    {
+        Exec(conn, tx,
+            "ALTER TABLE compaction_log ADD COLUMN source TEXT NOT NULL DEFAULT 'compaction'");
+    }
+
+    /// <summary>
+    /// Migration 5 — delete orphan rows across all 6 content/vec table
+    /// pairs. One-time hot-fix for DBs built under 0.6.7 and earlier,
+    /// where <c>MemoryDeleteHandler</c> called <c>store.Delete</c> before
+    /// <c>vec.DeleteEmbedding</c>, producing orphan vec rows, and the
+    /// un-transacted <c>memory_store</c> path occasionally produced
+    /// orphan content rows when the follow-up vec insert failed. The
+    /// corresponding handler bug is fixed in the same release; this
+    /// migration cleans up the historical debris left behind.
+    /// </summary>
+    private static void Migration5_CleanupOrphans(
+        MsSqliteConnection conn,
+        Microsoft.Data.Sqlite.SqliteTransaction tx)
+    {
+        // Frozen at the 6 pre-pinned pairs: on a fresh DB this migration runs
+        // before Migration 16 creates the pinned tables.
+        CleanupOrphanRowsInTransaction(conn, tx, AllContentTables());
+    }
+
+    /// <summary>
+    /// Delete orphan rows from every <c>(tier, type)</c> content/vec
+    /// table pair. An orphan is a vec row whose rowid has no matching
+    /// content row, or a content row whose rowid has no matching vec
+    /// row. Both directions are cleaned in a single transaction. Safe
+    /// to call repeatedly; idempotent. Exposed publicly so maintenance
+    /// tooling (and tests) can invoke the sweep directly without
+    /// manipulating <c>_schema_version</c>.
+    /// </summary>
+    public static void CleanupOrphanRows(MsSqliteConnection conn)
+    {
+        ArgumentNullException.ThrowIfNull(conn);
+        using var tx = conn.BeginTransaction();
+        CleanupOrphanRowsInTransaction(conn, tx, AllContentTables().Concat(PinnedContentTables));
+        tx.Commit();
+    }
+
+    /// <summary>The 6 live content-table base names derived from
+    /// <see cref="AllTablePairs"/>.</summary>
+    private static IEnumerable<string> AllContentTables() =>
+        AllTablePairs.Select(p => TableName(p.Tier, p.Type));
+
+    private static void CleanupOrphanRowsInTransaction(
+        MsSqliteConnection conn,
+        Microsoft.Data.Sqlite.SqliteTransaction tx,
+        IEnumerable<string> contentTables)
+    {
+        foreach (var contentTable in contentTables)
+        {
+            var vecTable = $"{contentTable}_vec";
+
+            // Orphan vec rows: rowids present in vec but not in content.
+            Exec(conn, tx,
+                $"DELETE FROM {vecTable} " +
+                $"WHERE rowid NOT IN (SELECT rowid FROM {contentTable})");
+
+            // Orphan content rows: rowids present in content but not in vec.
+            Exec(conn, tx,
+                $"DELETE FROM {contentTable} " +
+                $"WHERE rowid NOT IN (SELECT rowid FROM {vecTable})");
+        }
+    }
+
+    private static void Migration6_UsageTelemetry(
+        MsSqliteConnection conn,
+        Microsoft.Data.Sqlite.SqliteTransaction tx)
+    {
+        // Raw event log — one row per assistant turn. 30-day retention
+        // enforced by UsageDailyRollup. See spec §4.1.
+        Exec(conn, tx, """
+            CREATE TABLE IF NOT EXISTS usage_events (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                host                    TEXT NOT NULL,
+                host_event_id           TEXT NOT NULL,
+                session_id              TEXT NOT NULL,
+                interaction_id          TEXT,
+                turn_index              INTEGER,
+                ts                      INTEGER NOT NULL,
+                project_path            TEXT,
+                project_repo            TEXT,
+                project_branch          TEXT,
+                project_commit          TEXT,
+                model                   TEXT,
+                input_tokens            INTEGER,
+                cache_creation_5m       INTEGER,
+                cache_creation_1h       INTEGER,
+                cache_read              INTEGER,
+                output_tokens           INTEGER,
+                service_tier            TEXT,
+                server_tool_use_json    TEXT,
+                host_request_id         TEXT,
+                UNIQUE (host, host_event_id)
+            )
+            """);
+
+        Exec(conn, tx, "CREATE INDEX IF NOT EXISTS idx_usage_events_host_ts ON usage_events (host, ts)");
+        Exec(conn, tx, "CREATE INDEX IF NOT EXISTS idx_usage_events_ts      ON usage_events (ts)");
+        Exec(conn, tx, "CREATE INDEX IF NOT EXISTS idx_usage_events_session ON usage_events (host, session_id, turn_index)");
+        Exec(conn, tx, "CREATE INDEX IF NOT EXISTS idx_usage_events_project ON usage_events (project_repo, project_path)");
+
+        // Daily rollup — forever retention, bounded cardinality (~7k rows/year
+        // for a heavy user with 5 projects × 2 hosts × 2 models × 365 days).
+        Exec(conn, tx, """
+            CREATE TABLE IF NOT EXISTS usage_daily (
+                day_utc               INTEGER NOT NULL,
+                host                  TEXT NOT NULL,
+                model                 TEXT,
+                project               TEXT,                       -- denormalized COALESCE(project_repo, project_path) from usage_events
+                session_count         INTEGER NOT NULL,
+                turn_count            INTEGER NOT NULL,
+                input_tokens          INTEGER,
+                cache_creation_tokens INTEGER,
+                cache_read_tokens     INTEGER,
+                output_tokens         INTEGER,
+                PRIMARY KEY (day_utc, host, model, project)
+            )
+            """);
+
+        Exec(conn, tx, "CREATE INDEX IF NOT EXISTS idx_usage_daily_host_day ON usage_daily (host, day_utc)");
+        Exec(conn, tx, "CREATE INDEX IF NOT EXISTS idx_usage_daily_day      ON usage_daily (day_utc)");
+
+        // Per-host watermarks — used by UsageIndexer to skip already-scanned
+        // events on repeated session_start passes. See spec §4.3.
+        Exec(conn, tx, """
+            CREATE TABLE IF NOT EXISTS usage_watermarks (
+                host                      TEXT PRIMARY KEY,
+                last_indexed_ts           INTEGER NOT NULL,
+                last_scan_at              INTEGER NOT NULL,
+                last_rollup_at            INTEGER                 -- NULL until the first rollup pass runs for this host
+            )
+            """);
+    }
+
+    /// <summary>
+    /// Migration 7 — persistent outbound sync queue. Items are enqueued
+    /// when RoutingStore writes a local memory and drained by SyncService
+    /// to push to Cortex. Survives process crashes so pending items are
+    /// retried on next session start. See Task 11.
+    /// </summary>
+    private static void Migration7_SyncQueue(
+        MsSqliteConnection conn,
+        Microsoft.Data.Sqlite.SqliteTransaction tx)
+    {
+        Exec(conn, tx, """
+            CREATE TABLE IF NOT EXISTS sync_queue (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type TEXT NOT NULL,
+                operation   TEXT NOT NULL,
+                entity_id   TEXT,
+                payload     TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                attempts    INTEGER DEFAULT 0,
+                last_error  TEXT
+            )
+            """);
+    }
+
+    private static void Migration8_Scope(MsSqliteConnection conn, Microsoft.Data.Sqlite.SqliteTransaction tx)
+    {
+        foreach (var (tier, type) in AllTablePairs)
+        {
+            var table = TableName(tier, type);
+            using var alter = conn.CreateCommand();
+            alter.Transaction = tx;
+            alter.CommandText = $"ALTER TABLE {table} ADD COLUMN scope TEXT NOT NULL DEFAULT ''";
+            alter.ExecuteNonQuery();
+
+            using var idx = conn.CreateCommand();
+            idx.Transaction = tx;
+            idx.CommandText = $"CREATE INDEX IF NOT EXISTS idx_{table}_scope ON {table}(scope)";
+            idx.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>
+    /// Migration 9 — add an <c>entry_type</c> column to all six content
+    /// tables. Categorises each entry as one of the <see cref="EntryType"/>
+    /// DU cases ("Correction" / "Preference" / "Decision" / "Surfaced" /
+    /// "Imported" / "Compacted" / "Ingested"). Pre-v9 rows default to
+    /// <c>'Preference'</c> so historical data keeps a valid value and the
+    /// Decay module, which pattern-matches on EntryType, can score them
+    /// without a migration fallback. The column is required because the
+    /// outbound Cortex sync DTO expects a non-null entry_type — dropping it
+    /// at the plugin layer was the root cause of garbage values landing
+    /// server-side (Phase 1 of the cortex-sync bug hunt).
+    /// </summary>
+    private static void Migration9_EntryType(
+        MsSqliteConnection conn,
+        Microsoft.Data.Sqlite.SqliteTransaction tx)
+    {
+        foreach (var (tier, type) in AllTablePairs)
+        {
+            var table = TableName(tier, type);
+            using var alter = conn.CreateCommand();
+            alter.Transaction = tx;
+            alter.CommandText =
+                $"ALTER TABLE {table} ADD COLUMN entry_type TEXT NOT NULL DEFAULT 'Preference'";
+            alter.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>
+    /// Migration 10 — local skill metadata cache. Stores a lightweight copy
+    /// of skills pulled from Cortex so the plugin can answer
+    /// <c>skill_list</c> / <c>skill_search</c> tool calls without a network
+    /// round-trip. <c>is_orphaned</c> flags skills no longer returned by the
+    /// server so they can be cleaned up on the next pull cycle.
+    /// </summary>
+    private static void Migration10_SkillCache(
+        MsSqliteConnection conn,
+        Microsoft.Data.Sqlite.SqliteTransaction tx)
+    {
+        Exec(conn, tx, """
+            CREATE TABLE IF NOT EXISTS skill_cache (
+                id          TEXT PRIMARY KEY,
+                name        TEXT NOT NULL,
+                description TEXT,
+                scope       TEXT NOT NULL,
+                scope_id    TEXT NOT NULL,
+                tags        TEXT NOT NULL,
+                source      TEXT,
+                version     INTEGER NOT NULL DEFAULT 1,
+                is_orphaned INTEGER NOT NULL DEFAULT 0,
+                updated_at  TEXT NOT NULL
+            )
+            """);
+
+        Exec(conn, tx,
+            "CREATE INDEX IF NOT EXISTS ix_skill_cache_scope ON skill_cache(scope, scope_id)");
+    }
+
+    /// <summary>
+    /// Migration 11 — adds <c>sync_queue.next_attempt_at</c> for exponential
+    /// backoff retry. Replaces the old hard <c>attempts &lt; 10</c> drop policy:
+    /// failed items are now eligible to retry forever, but spaced out by an
+    /// exponentially growing window (60s, 120s, 240s, ..., capped at 1h).
+    /// NULL means immediately eligible (the default for fresh enqueues).
+    /// </summary>
+    private static void Migration11_SyncQueueBackoff(
+        MsSqliteConnection conn,
+        Microsoft.Data.Sqlite.SqliteTransaction tx)
+    {
+        Exec(conn, tx,
+            "ALTER TABLE sync_queue ADD COLUMN next_attempt_at TEXT");
+
+        // Existing rows that previously hit the attempts cap stay where they
+        // are; the new Drain query will pick them up immediately because
+        // next_attempt_at is NULL (= "ready now").
+    }
+
+    /// <summary>
+    /// Migration 12 — adds content, frontmatter_json, content_hash,
+    /// content_embedding, and embedder_fingerprint columns to skill_cache,
+    /// plus a unique index on (name, scope, scope_id) for natural-key lookups.
+    /// </summary>
+    private static void Migration12_SkillCacheContentAndEmbedding(
+        MsSqliteConnection conn,
+        Microsoft.Data.Sqlite.SqliteTransaction tx)
+    {
+        Exec(conn, tx, "ALTER TABLE skill_cache ADD COLUMN content TEXT NOT NULL DEFAULT ''");
+        Exec(conn, tx, "ALTER TABLE skill_cache ADD COLUMN frontmatter_json TEXT");
+        Exec(conn, tx, "ALTER TABLE skill_cache ADD COLUMN content_hash TEXT");
+        Exec(conn, tx, "ALTER TABLE skill_cache ADD COLUMN content_embedding BLOB");
+        Exec(conn, tx, "ALTER TABLE skill_cache ADD COLUMN embedder_fingerprint TEXT");
+        Exec(conn, tx,
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_skill_cache_natural_key ON skill_cache(name, scope, scope_id)");
+    }
+
+    /// <summary>
+    /// Migration 13 — adds skill usage counter columns and skill_usage_events table.
+    /// Columns added to skill_cache: usage_count, last_used_at, decay_score.
+    /// New table skill_usage_events tracks per-host/session usage with sync status.
+    /// </summary>
+    private static void Migration13_SkillUsage(
+        MsSqliteConnection conn,
+        Microsoft.Data.Sqlite.SqliteTransaction tx)
+    {
+        Exec(conn, tx, "ALTER TABLE skill_cache ADD COLUMN usage_count INTEGER NOT NULL DEFAULT 0");
+        Exec(conn, tx, "ALTER TABLE skill_cache ADD COLUMN last_used_at TEXT");
+        Exec(conn, tx, "ALTER TABLE skill_cache ADD COLUMN decay_score REAL NOT NULL DEFAULT 0");
+        Exec(conn, tx, """
+            CREATE TABLE IF NOT EXISTS skill_usage_events (
+                id           TEXT PRIMARY KEY,
+                skill_id     TEXT NOT NULL,
+                occurred_at  TEXT NOT NULL,
+                host         TEXT,
+                session_id   TEXT,
+                synced_at    TEXT
+            )
+            """);
+        Exec(conn, tx,
+            "CREATE INDEX IF NOT EXISTS ix_skill_usage_events_skill_id ON skill_usage_events(skill_id)");
+        Exec(conn, tx,
+            "CREATE INDEX IF NOT EXISTS ix_skill_usage_events_unsynced ON skill_usage_events(synced_at) WHERE synced_at IS NULL");
+    }
+
+    /// <summary>
+    /// Migration 14 — adds <c>times_injected</c> column to all six content
+    /// tables. Tracks how many times each entry has been fed to the host LLM
+    /// via BuildContext. Powers per-type decay enhancements and auto-demotion
+    /// of dead-weight entries (Phase 2 idea 1c).
+    /// </summary>
+    private static void Migration14_TimesInjected(
+        MsSqliteConnection conn,
+        Microsoft.Data.Sqlite.SqliteTransaction tx)
+    {
+        foreach (var (tier, type) in AllTablePairs)
+        {
+            var table = TableName(tier, type);
+            using var alter = conn.CreateCommand();
+            alter.Transaction = tx;
+            alter.CommandText =
+                $"ALTER TABLE {table} ADD COLUMN times_injected INTEGER NOT NULL DEFAULT 0";
+            alter.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>
+    /// Migration 15 — <c>tool_cache</c> table for tool-result caching
+    /// (Phase 3 idea 2c). Stores host tool results keyed by
+    /// (tool, args_hash). TTL governs freshness at read time;
+    /// ToolCacheStore enforces LRU capacity on write.
+    /// </summary>
+    private static void Migration15_ToolCache(
+        MsSqliteConnection conn,
+        Microsoft.Data.Sqlite.SqliteTransaction tx)
+    {
+        Exec(conn, tx, """
+            CREATE TABLE IF NOT EXISTS tool_cache (
+                tool           TEXT NOT NULL,
+                args_hash      TEXT NOT NULL,
+                content        TEXT NOT NULL,
+                content_hash   TEXT NOT NULL,
+                stored_at_ms   INTEGER NOT NULL,
+                ttl_seconds    INTEGER NOT NULL DEFAULT 600,
+                hit_count      INTEGER NOT NULL DEFAULT 0,
+                last_hit_at_ms INTEGER,
+                token_estimate INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (tool, args_hash)
+            )
+            """);
+
+        // TTL purge scans filter on stored_at_ms; the LRU eviction path
+        // sorts by COALESCE(last_hit_at_ms, stored_at_ms) over a table
+        // capped at ~200 rows, so only the purge column gets an index.
+        Exec(conn, tx,
+            "CREATE INDEX IF NOT EXISTS idx_tool_cache_stored_at ON tool_cache(stored_at_ms)");
+    }
+
+    /// <summary>
+    /// Migration 16 — pinned tier (spec 2026-06-09). Creates
+    /// pinned_memories / pinned_knowledge with the full current column set
+    /// (scope, entry_type, times_injected included — migrations 8/9/14 only
+    /// touch the original six tables), plus vec0 + FTS5 + triggers + indexes
+    /// mirroring Migrations 1 and 3. MigrationRunner.AllTablePairs is NOT
+    /// extended: it describes the table set managed by migrations 1-15.
+    /// </summary>
+    private static void Migration16_PinnedTier(
+        MsSqliteConnection conn,
+        Microsoft.Data.Sqlite.SqliteTransaction tx)
+    {
+        foreach (var tbl in PinnedContentTables)
+        {
+            var vecTbl = $"{tbl}_vec";
+            var ftsTbl = $"{tbl}_fts";
+
+            Exec(conn, tx, $$"""
+                CREATE TABLE IF NOT EXISTS {{tbl}} (
+                    id                TEXT PRIMARY KEY NOT NULL,
+                    content           TEXT NOT NULL,
+                    summary           TEXT,
+                    source            TEXT,
+                    source_tool       TEXT,
+                    project           TEXT,
+                    tags              TEXT DEFAULT '[]',
+                    created_at        INTEGER NOT NULL,
+                    updated_at        INTEGER NOT NULL,
+                    last_accessed_at  INTEGER NOT NULL,
+                    access_count      INTEGER DEFAULT 0,
+                    decay_score       REAL DEFAULT 1.0,
+                    parent_id         TEXT,
+                    collection_id     TEXT,
+                    metadata          TEXT DEFAULT '{}',
+                    scope             TEXT NOT NULL DEFAULT '',
+                    entry_type        TEXT NOT NULL DEFAULT 'Preference',
+                    times_injected    INTEGER NOT NULL DEFAULT 0
+                )
+                """);
+
+            Exec(conn, tx,
+                $"CREATE VIRTUAL TABLE IF NOT EXISTS {vecTbl} USING vec0(embedding float[384])");
+
+            foreach (var idx in ContentTableIndexes(tbl))
+                Exec(conn, tx, idx);
+            Exec(conn, tx, $"CREATE INDEX IF NOT EXISTS idx_{tbl}_scope ON {tbl}(scope)");
+
+            Exec(conn, tx,
+                $"CREATE VIRTUAL TABLE IF NOT EXISTS {ftsTbl} USING fts5(content, tags, content={tbl}, content_rowid=rowid)");
+
+            Exec(conn, tx, $$"""
+                CREATE TRIGGER IF NOT EXISTS {{tbl}}_fts_ai AFTER INSERT ON {{tbl}} BEGIN
+                    INSERT INTO {{ftsTbl}}(rowid, content, tags) VALUES (new.rowid, new.content, new.tags);
+                END
+                """);
+            Exec(conn, tx, $$"""
+                CREATE TRIGGER IF NOT EXISTS {{tbl}}_fts_ad AFTER DELETE ON {{tbl}} BEGIN
+                    INSERT INTO {{ftsTbl}}({{ftsTbl}}, rowid, content, tags) VALUES('delete', old.rowid, old.content, old.tags);
+                END
+                """);
+            Exec(conn, tx, $$"""
+                CREATE TRIGGER IF NOT EXISTS {{tbl}}_fts_au AFTER UPDATE ON {{tbl}} BEGIN
+                    INSERT INTO {{ftsTbl}}({{ftsTbl}}, rowid, content, tags) VALUES('delete', old.rowid, old.content, old.tags);
+                    INSERT INTO {{ftsTbl}}(rowid, content, tags) VALUES (new.rowid, new.content, new.tags);
+                END
+                """);
+
+            // No FTS backfill needed (unlike Migration 3): pinned tables are always empty at migration time.
+        }
+    }
+
+    /// <summary>
+    /// Migration 17 — adds a <c>sticky</c> column to the hot tier content
+    /// tables (tier model v2). Sticky is a hot-only concept: warm/cold/pinned
+    /// tables are untouched. <c>ALTER TABLE ... ADD COLUMN</c> is not
+    /// idempotent in SQLite, so this guards on <c>pragma_table_info</c>
+    /// before adding.
+    /// </summary>
+    private static void Migration17_HotStickyColumn(
+        MsSqliteConnection conn,
+        Microsoft.Data.Sqlite.SqliteTransaction tx)
+    {
+        foreach (var (tier, type) in new[]
+                 {
+                     (Tier.Hot, ContentType.Memory),
+                     (Tier.Hot, ContentType.Knowledge),
+                 })
+        {
+            var tbl = TableName(tier, type);
+            // ADD COLUMN is not idempotent in SQLite; guard on pragma_table_info.
+            using (var check = conn.CreateCommand())
+            {
+                check.Transaction = tx;
+                check.CommandText =
+                    $"SELECT COUNT(*) FROM pragma_table_info('{tbl}') WHERE name = 'sticky'";
+                if ((long)check.ExecuteScalar()! == 0L)
+                    Exec(conn, tx, $"ALTER TABLE {tbl} ADD COLUMN sticky INTEGER NOT NULL DEFAULT 0");
+            }
+            Exec(conn, tx, $"CREATE INDEX IF NOT EXISTS idx_{tbl}_sticky ON {tbl}(sticky)");
+        }
+    }
+
+    // --- helpers ----------------------------------------------------------
+
+    private static void Exec(
+        MsSqliteConnection conn,
+        Microsoft.Data.Sqlite.SqliteTransaction tx,
+        string sql)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = sql;
+        cmd.ExecuteNonQuery();
+    }
+}

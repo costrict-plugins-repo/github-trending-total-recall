@@ -1,0 +1,75 @@
+{
+  "name": "@strvmarv/total-recall",
+  "version": "4.2.3",
+  "description": "Multi-tiered memory and knowledge base plugin for TUI coding assistants",
+  "type": "module",
+  "main": "bin/start.js",
+  "bin": {
+    "total-recall": "bin/start.js"
+  },
+  "scripts": {
+    "prepare": "git config core.hooksPath git-hooks || true",
+    "postinstall": "node scripts/postinstall.js",
+    "prepublishOnly": "node scripts/verify-binaries.js",
+    "test:shim": "node --test bin/shim/ scripts/fetch-binary.test.js hooks/hooks.config.test.js"
+  },
+  "files": [
+    "bin/",
+    "catalog.json",
+    "binaries/",
+    "models/",
+    "scripts/",
+    "eval/",
+    "skills/",
+    "agents/",
+    "hooks/",
+    "hermes-plugin/",
+    ".claude-plugin/",
+    ".copilot-plugin/",
+    ".cursor-plugin/",
+    ".opencode/",
+    ".kiro/",
+    ".mcp.json",
+    "README.md",
+    "LICENSE",
+    "CONTRIBUTING.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/strvmarv/total-recall.git"
+  },
+  "homepage": "https://github.com/strvmarv/total-recall",
+  "bugs": {
+    "url": "https://github.com/strvmarv/total-recall/issues"
+  },
+  "author": "strvmarv",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "memory",
+    "agent-memory",
+    "knowledge-base",
+    "rag",
+    "claude-code",
+    "copilot-cli",
+    "gemini-cli",
+    "opencode",
+    "cline",
+    "cursor",
+    "sqlite",
+    "vector-search",
+    "hybrid-search",
+    "embeddings",
+    "ai-coding",
+    "tui"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "sqlite-vec": "^0.1.0"
+  }
+}

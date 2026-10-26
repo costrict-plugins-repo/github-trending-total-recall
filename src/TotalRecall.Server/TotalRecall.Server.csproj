@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>TotalRecall.Server</RootNamespace>
+    <AssemblyName>TotalRecall.Server</AssemblyName>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsAotCompatible>true</IsAotCompatible>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="TotalRecall.Server.Tests" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\TotalRecall.Core\TotalRecall.Core.fsproj" />
+    <ProjectReference Include="..\TotalRecall.Infrastructure\TotalRecall.Infrastructure.csproj" />
+  </ItemGroup>
+</Project>

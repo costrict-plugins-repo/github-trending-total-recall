@@ -1,0 +1,52 @@
+#!/usr/bin/env node
+// npm postinstall hook: downloads the correct platform binary into
+// binaries/<rid>/ if it is not already present.
+//
+// This is the fast path for users who install via `npm install` (direct
+// or via a plugin manager that runs lifecycle scripts). It runs once at
+// install time, pulls the right binary from GitHub Releases, and writes
+// it to the plugin directory.
+//
+// Failures are intentionally NON-FATAL (always exit 0). Reasons:
+//   - `npm install --ignore-scripts` should not break the install
+//   - Offline installs should still lay down the file tree
+//   - Corporate networks that block github.com should not block npm install
+//
+// In all those cases, bin/start.js runs the same ensureBinary() as a
+// fallback at first launch, so the failure here is recoverable later.
+
+import { ensureBinary } from './fetch-binary.js';
+import { installHermesPlugin } from './install-hermes-plugin.js';
+import { installKiroHooks } from './install-kiro-hooks.js';
+import { installCline } from './install-cline.js';
+import { installWindsurf } from './install-windsurf.js';
+import { installGemini } from './install-gemini.js';
+import { installZed } from './install-zed.js';
+import { installVsCode } from './install-vscode.js';
+
+const result = await ensureBinary({ logPrefix: '[total-recall:postinstall]' });
+
+if (!result.ok) {
+  process.stderr.write(`[total-recall:postinstall] warning: ${result.error}\n`);
+  if (result.url) {
+    process.stderr.write(`[total-recall:postinstall]   url: ${result.url}\n`);
+  }
+  process.stderr.write(
+    '[total-recall:postinstall] The binary will be downloaded on first launch instead.\n'
+  );
+}
+
+// Install Hermes MemoryProvider plugin if Hermes is detected
+await installHermesPlugin();
+
+// Install Kiro hooks and steering if Kiro is detected
+await installKiroHooks();
+
+// Install host MCP configs if detected
+await installCline();
+await installWindsurf();
+await installGemini();
+await installZed();
+await installVsCode();
+
+process.exit(0);

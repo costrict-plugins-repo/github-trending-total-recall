@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>TotalRecall.Core</RootNamespace>
+    <AssemblyName>TotalRecall.Core</AssemblyName>
+    <IsAotCompatible>true</IsAotCompatible>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Types.fs" />
+    <Compile Include="Config.fs" />
+    <Compile Include="Tokenizer.fs" />
+    <Compile Include="Decay.fs" />
+    <Compile Include="Ranking.fs" />
+    <Compile Include="Compaction.fs" />
+    <Compile Include="Parsers.fs" />
+    <Compile Include="Chunker.fs" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,534 @@
+// Plan 4 Task 4.9 — KbSearchHandler contract tests. Mirrors
+// MemorySearchHandlerTests structure but asserts kb_search's narrower
+// semantics: cold/knowledge-only, optional post-hoc collection filter, TS
+// `top_k` field (not `topK`), and the stubbed `hierarchicalMatch` /
+// `needsSummary` Plan 4 behaviour.
+
+namespace TotalRecall.Server.Tests;
+
+using System;
+using System.Linq;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.FSharp.Collections;
+using Microsoft.FSharp.Core;
+using TotalRecall.Core;
+using TotalRecall.Infrastructure.Search;
+using TotalRecall.Infrastructure.Storage;
+using TotalRecall.Infrastructure.Sync;
+using TotalRecall.Infrastructure.Telemetry;
+using TotalRecall.Server.Handlers;
+using TotalRecall.Server.Tests.TestSupport;
+using Xunit;
+
+public class KbSearchHandlerTests
+{
+    private static Entry MakeEntry(
+        string id,
+        string? collectionId = null,
+        string? parentId = null) =>
+        new(
+            id,
+            "content",
+            FSharpOption<string>.None,
+            FSharpOption<string>.None,
+            FSharpOption<SourceTool>.None,
+            FSharpOption<string>.None,
+            ListModule.Empty<string>(),
+            0L,
+            0L,
+            0L,
+            0,
+            1.0,
+            parentId is null ? FSharpOption<string>.None : FSharpOption<string>.Some(parentId),
+            collectionId is null ? FSharpOption<string>.None : FSharpOption<string>.Some(collectionId),
+            "",
+            EntryType.Preference,
+            "{}", 0);
+
+    private static SearchResult MakeResult(
+        string id,
+        double score = 0.8,
+        int rank = 1,
+        string? collectionId = null,
+        string? parentId = null) =>
+        new(MakeEntry(id, collectionId, parentId), Tier.Cold, ContentType.Knowledge, score, rank);
+
+    private static (KbSearchHandler handler, RecordingFakeEmbedder embed, RecordingFakeHybridSearch hybrid) NewFixture()
+    {
+        var embed = new RecordingFakeEmbedder();
+        var hybrid = new RecordingFakeHybridSearch();
+        var handler = new KbSearchHandler(embed, hybrid);
+        return (handler, embed, hybrid);
+    }
+
+    private static JsonElement Args(string json) =>
+        JsonDocument.Parse(json).RootElement.Clone();
+
+    [Fact]
+    public async Task HappyPath_ReturnsResultsFromColdKnowledge()
+    {
+        var (handler, _, hybrid) = NewFixture();
+        hybrid.NextResult = new[] { MakeResult("id-1", 0.9, 1) };
+
+        var result = await handler.ExecuteAsync(
+            Args("""{"query":"hello"}"""),
+            CancellationToken.None);
+
+        Assert.NotEqual(true, result.IsError);
+        using var doc = JsonDocument.Parse(result.Content[0].Text);
+        var root = doc.RootElement;
+        Assert.True(root.TryGetProperty("results", out var results));
+        Assert.Equal(1, results.GetArrayLength());
+        Assert.Equal("id-1", results[0].GetProperty("entry").GetProperty("id").GetString());
+        Assert.Equal("cold", results[0].GetProperty("tier").GetString());
+        Assert.Equal("knowledge", results[0].GetProperty("content_type").GetString());
+
+        // kb_search scopes to exactly one (tier, content_type) pair.
+        Assert.Single(hybrid.Calls);
+        Assert.Single(hybrid.Calls[0].Tiers);
+        Assert.True(hybrid.Calls[0].Tiers[0].Tier.IsCold);
+        Assert.True(hybrid.Calls[0].Tiers[0].Type.IsKnowledge);
+    }
+
+    [Fact]
+    public async Task HappyPath_EmptyQuery_Throws()
+    {
+        var (handler, _, _) = NewFixture();
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            handler.ExecuteAsync(Args("""{"query":""}"""), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task CollectionFilter_OnlyMatchingResults()
+    {
+        var (handler, _, hybrid) = NewFixture();
+        hybrid.NextResult = new[]
+        {
+            MakeResult("a", 0.9, 1, collectionId: "coll-1"),
+            MakeResult("b", 0.8, 2, collectionId: "coll-2"),
+            MakeResult("c", 0.7, 3, parentId: "coll-1"),
+            MakeResult("d", 0.6, 4, collectionId: "coll-other"),
+        };
+
+        var result = await handler.ExecuteAsync(
+            Args("""{"query":"q","collection":"coll-1"}"""),
+            CancellationToken.None);
+
+        using var doc = JsonDocument.Parse(result.Content[0].Text);
+        var results = doc.RootElement.GetProperty("results");
+        Assert.Equal(2, results.GetArrayLength());
+        Assert.Equal("a", results[0].GetProperty("entry").GetProperty("id").GetString());
+        Assert.Equal("c", results[1].GetProperty("entry").GetProperty("id").GetString());
+    }
+
+    [Fact]
+    public async Task CollectionFilter_RequestsDoubleTopKFromHybrid()
+    {
+        var (handler, _, hybrid) = NewFixture();
+
+        await handler.ExecuteAsync(
+            Args("""{"query":"q","collection":"coll-1","top_k":5}"""),
+            CancellationToken.None);
+
+        // With a collection filter, we request topK*2 to leave headroom.
+        Assert.Equal(10, hybrid.Calls[0].Opts.TopK);
+    }
+
+    [Fact]
+    public async Task DefaultsTopKTo10()
+    {
+        var (handler, _, hybrid) = NewFixture();
+
+        await handler.ExecuteAsync(Args("""{"query":"q"}"""), CancellationToken.None);
+
+        Assert.Equal(10, hybrid.Calls[0].Opts.TopK);
+    }
+
+    [Fact]
+    public async Task CustomTopK_PassedThrough_WhenNoCollection()
+    {
+        var (handler, _, hybrid) = NewFixture();
+
+        await handler.ExecuteAsync(Args("""{"query":"q","top_k":25}"""), CancellationToken.None);
+
+        Assert.Equal(25, hybrid.Calls[0].Opts.TopK);
+    }
+
+    [Fact]
+    public async Task InvalidTopK_OutOfRange_Throws()
+    {
+        var (handler, _, _) = NewFixture();
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            handler.ExecuteAsync(Args("""{"query":"q","top_k":0}"""), CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            handler.ExecuteAsync(Args("""{"query":"q","top_k":1001}"""), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task NeedsSummary_AlwaysFalse_InPlan4()
+    {
+        var (handler, _, hybrid) = NewFixture();
+        hybrid.NextResult = new[] { MakeResult("a", 0.9, 1, collectionId: "coll-1") };
+
+        var result = await handler.ExecuteAsync(
+            Args("""{"query":"q","collection":"coll-1"}"""),
+            CancellationToken.None);
+
+        using var doc = JsonDocument.Parse(result.Content[0].Text);
+        Assert.False(doc.RootElement.GetProperty("needsSummary").GetBoolean());
+    }
+
+    [Fact]
+    public async Task HierarchicalMatch_AlwaysNull_InPlan4()
+    {
+        var (handler, _, _) = NewFixture();
+
+        var result = await handler.ExecuteAsync(
+            Args("""{"query":"q"}"""),
+            CancellationToken.None);
+
+        using var doc = JsonDocument.Parse(result.Content[0].Text);
+        Assert.Equal(JsonValueKind.Null, doc.RootElement.GetProperty("hierarchicalMatch").ValueKind);
+    }
+
+    [Fact]
+    public async Task MissingQuery_Throws()
+    {
+        var (handler, _, _) = NewFixture();
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            handler.ExecuteAsync(Args("""{"top_k":5}"""), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task NullArguments_Throws()
+    {
+        var (handler, _, _) = NewFixture();
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            handler.ExecuteAsync(null, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Cancellation_Propagates()
+    {
+        var (handler, _, _) = NewFixture();
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() =>
+            handler.ExecuteAsync(Args("""{"query":"q"}"""), cts.Token));
+    }
+
+    [Fact]
+    public async Task EmbedderCalled_OnceWithQuery()
+    {
+        var (handler, embed, _) = NewFixture();
+
+        await handler.ExecuteAsync(
+            Args("""{"query":"hello world"}"""),
+            CancellationToken.None);
+
+        Assert.Single(embed.Calls);
+        Assert.Equal("hello world", embed.Calls[0]);
+    }
+
+    [Fact]
+    public async Task Embedder_UsesEmbedQuery_ForAsymmetricPrefix()
+    {
+        var (handler, fake, _) = NewFixture();
+
+        await handler.ExecuteAsync(
+            Args("""{"query":"hello world"}"""),
+            CancellationToken.None);
+
+        // Queries must flow through EmbedQuery so the ONNX embedder prepends
+        // the bge asymmetric instruction prefix (default impl stays symmetric).
+        Assert.True(fake.EmbedQueryCalled);
+    }
+
+    [Fact]
+    public async Task Scopes_SingleValue_PassedToHybridOpts()
+    {
+        var (handler, _, hybrid) = NewFixture();
+
+        await handler.ExecuteAsync(
+            Args("""{"query":"q","scopes":["user:paul"]}"""),
+            CancellationToken.None);
+
+        var scopes = hybrid.Calls[0].Opts.Scopes;
+        Assert.NotNull(scopes);
+        Assert.Single(scopes);
+        Assert.Equal("user:paul", scopes[0]);
+    }
+
+    [Fact]
+    public async Task Scopes_MultipleValues_PassedToHybridOpts()
+    {
+        var (handler, _, hybrid) = NewFixture();
+
+        await handler.ExecuteAsync(
+            Args("""{"query":"q","scopes":["user:paul","global:jira"]}"""),
+            CancellationToken.None);
+
+        var scopes = hybrid.Calls[0].Opts.Scopes;
+        Assert.NotNull(scopes);
+        Assert.Equal(2, scopes!.Count);
+        Assert.Equal("user:paul", scopes[0]);
+        Assert.Equal("global:jira", scopes[1]);
+    }
+
+    [Fact]
+    public async Task Scopes_WhenOmitted_NullPassedToHybridOpts()
+    {
+        var (handler, _, hybrid) = NewFixture();
+
+        await handler.ExecuteAsync(
+            Args("""{"query":"q"}"""),
+            CancellationToken.None);
+
+        Assert.Null(hybrid.Calls[0].Opts.Scopes);
+    }
+
+    [Fact]
+    public async Task Scopes_EmptyArray_NoDefault_PassesNullToHybridOpts()
+    {
+        var (handler, _, hybrid) = NewFixture();
+
+        await handler.ExecuteAsync(
+            Args("""{"query":"q","scopes":[]}"""),
+            CancellationToken.None);
+
+        // Empty array with no configured default resolves to null (no scope filter).
+        Assert.Null(hybrid.Calls[0].Opts.Scopes);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_WithoutScopes_UsesConfiguredDefault()
+    {
+        var embed = new RecordingFakeEmbedder();
+        var hybrid = new RecordingFakeHybridSearch();
+        var handler = new KbSearchHandler(embed, hybrid, remote: null, scopeDefault: "user:configured");
+
+        await handler.ExecuteAsync(Args("""{"query":"q"}"""), CancellationToken.None);
+
+        var scopes = hybrid.Calls[0].Opts.Scopes;
+        Assert.NotNull(scopes);
+        Assert.Single(scopes!);
+        Assert.Equal("user:configured", scopes![0]);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_ExplicitScopesOverrideConfiguredDefault()
+    {
+        var embed = new RecordingFakeEmbedder();
+        var hybrid = new RecordingFakeHybridSearch();
+        var handler = new KbSearchHandler(embed, hybrid, remote: null, scopeDefault: "user:configured");
+
+        await handler.ExecuteAsync(
+            Args("""{"query":"q","scopes":["team:eng"]}"""),
+            CancellationToken.None);
+
+        var scopes = hybrid.Calls[0].Opts.Scopes;
+        Assert.NotNull(scopes);
+        Assert.Single(scopes!);
+        Assert.Equal("team:eng", scopes![0]);
+    }
+
+    // ---------------- Phase 5: retrieval telemetry ----------------
+
+    [Fact]
+    public async Task Phase5_LogsRetrievalEventAndEnqueuesSyncPayload()
+    {
+        using var conn = SqliteConnection.Open(":memory:");
+        MigrationRunner.RunMigrations(conn);
+
+        var embed = new RecordingFakeEmbedder();
+        var hybrid = new RecordingFakeHybridSearch
+        {
+            NextResult = new[]
+            {
+                MakeResult("kb-1", score: 0.88, rank: 1),
+                MakeResult("kb-2", score: 0.55, rank: 2),
+            },
+        };
+        var retrievalLog = new RetrievalEventLog(conn);
+        var syncQueue = new SyncQueue(conn);
+
+        var handler = new KbSearchHandler(
+            embed, hybrid,
+            remote: null,
+            scopeDefault: null,
+            retrievalLog: retrievalLog,
+            syncQueue: syncQueue);
+
+        await handler.ExecuteAsync(
+            Args("""{"query":"kb hello","top_k":4}"""),
+            CancellationToken.None);
+
+        // --- local row ---
+        var rows = retrievalLog.GetEvents(new RetrievalEventQuery());
+        Assert.Single(rows);
+        var row = rows[0];
+        Assert.Equal("kb hello", row.QueryText);
+        Assert.Equal("assistant", row.QuerySource);
+        Assert.Equal(2, row.ResultCount);
+
+        using (var tiersDoc = JsonDocument.Parse(row.TiersSearchedJson))
+        {
+            // kb_search is scoped to exactly one (cold, knowledge) pair.
+            Assert.Equal(1, tiersDoc.RootElement.GetArrayLength());
+            Assert.Equal("cold_knowledge", tiersDoc.RootElement[0].GetString());
+        }
+
+        // --- sync queue payload ---
+        var items = syncQueue.Drain(limit: 10);
+        Assert.Single(items);
+        var item = items[0];
+        Assert.Equal("retrieval", item.EntityType);
+
+        using var doc = JsonDocument.Parse(item.Payload);
+        var evt = doc.RootElement[0];
+        Assert.Equal("kb hello", evt.GetProperty("query").GetString());
+        Assert.Equal(4, evt.GetProperty("top_k").GetInt32());
+        Assert.Equal(2, evt.GetProperty("result_count").GetInt32());
+        Assert.Equal(0.88, evt.GetProperty("top_score").GetDouble(), 6);
+        Assert.Equal(1, evt.GetProperty("tiers_searched").GetArrayLength());
+        Assert.Equal("cold_knowledge", evt.GetProperty("tiers_searched")[0].GetString());
+    }
+
+    [Fact]
+    public async Task Phase5_WithoutSinks_DoesNotThrow()
+    {
+        // Sqlite-only composition path — both sinks null. Must not throw.
+        var (handler, _, _) = NewFixture();
+
+        var result = await handler.ExecuteAsync(
+            Args("""{"query":"q"}"""),
+            CancellationToken.None);
+
+        Assert.NotEqual(true, result.IsError);
+    }
+
+    // ---------------- Remote (cortex) path: retrievalId shape ----------------
+
+    /// <summary>
+    /// Stub IRemoteBackend whose SearchKnowledgeAsync returns a caller-supplied array.
+    /// All other methods are no-ops; only SearchKnowledge is exercised by these tests.
+    /// </summary>
+    private sealed class StubRemoteBackend : IRemoteBackend
+    {
+        public SyncSearchResult[] KbResults { get; set; } = Array.Empty<SyncSearchResult>();
+
+        public Task<SyncSearchResult[]> SearchKnowledgeAsync(string query, int topK, IReadOnlyList<string>? scopes, CancellationToken ct)
+            => Task.FromResult(KbResults);
+        public Task<SyncSearchResult[]> SearchMemoriesAsync(string query, string scope, int topK, CancellationToken ct)
+            => Task.FromResult(Array.Empty<SyncSearchResult>());
+        public Task<SyncStatusResult> GetStatusAsync(CancellationToken ct)
+            => Task.FromResult(new SyncStatusResult(0, 0, 0, 0));
+        public Task UpsertMemoriesAsync(SyncEntry[] entries, CancellationToken ct) => Task.CompletedTask;
+        public Task DeleteMemoryAsync(string id, CancellationToken ct) => Task.CompletedTask;
+        public Task<SyncPullResult> GetUserMemoriesModifiedSinceAsync(DateTimeOffset since, CancellationToken ct)
+            => Task.FromResult(new SyncPullResult(Array.Empty<SyncEntry>(), null));
+        public Task PushUsageEventsAsync(SyncUsageEvent[] events, CancellationToken ct) => Task.CompletedTask;
+        public Task PushRetrievalEventsAsync(SyncRetrievalEvent[] events, CancellationToken ct) => Task.CompletedTask;
+        public Task PushCompactionEntriesAsync(SyncCompactionEntry[] entries, CancellationToken ct) => Task.CompletedTask;
+        public Task PushSkillUsageAsync(PluginSyncSkillUsageEvent[] events, CancellationToken ct) => Task.CompletedTask;
+        public Task<PluginSyncSkillDto[]> GetSkillsModifiedSinceAsync(DateTime? since, CancellationToken ct)
+            => Task.FromResult(Array.Empty<PluginSyncSkillDto>());
+    }
+
+    [Fact]
+    public async Task Remote_NonEmptyResults_IncludesRetrievalIdKey()
+    {
+        var stub = new StubRemoteBackend
+        {
+            KbResults = new[]
+            {
+                new SyncSearchResult("remote-1", "some content", 0.9, null, null),
+            },
+        };
+        var embed = new RecordingFakeEmbedder();
+        var hybrid = new RecordingFakeHybridSearch();
+        var handler = new KbSearchHandler(embed, hybrid, remote: stub);
+
+        var result = await handler.ExecuteAsync(
+            Args("""{"query":"remote query"}"""),
+            CancellationToken.None);
+
+        Assert.NotEqual(true, result.IsError);
+        using var doc = JsonDocument.Parse(result.Content[0].Text);
+        var root = doc.RootElement;
+
+        // retrievalId must be present as the first top-level key and be empty string
+        // (remote path does not log locally — cortex records telemetry server-side).
+        Assert.True(root.TryGetProperty("retrievalId", out var ridProp),
+            "remote kb_search envelope must contain a top-level 'retrievalId' key");
+        Assert.Equal("", ridProp.GetString());
+
+        // Wire shape must still include the other expected keys.
+        Assert.True(root.TryGetProperty("results", out var results));
+        Assert.Equal(1, results.GetArrayLength());
+        Assert.Equal(JsonValueKind.Null, root.GetProperty("hierarchicalMatch").ValueKind);
+        Assert.False(root.GetProperty("needsSummary").GetBoolean());
+    }
+
+    [Fact]
+    public async Task Remote_EmptyResults_IncludesRetrievalIdKey()
+    {
+        var stub = new StubRemoteBackend { KbResults = Array.Empty<SyncSearchResult>() };
+        var embed = new RecordingFakeEmbedder();
+        var hybrid = new RecordingFakeHybridSearch();
+        var handler = new KbSearchHandler(embed, hybrid, remote: stub);
+
+        var result = await handler.ExecuteAsync(
+            Args("""{"query":"remote query"}"""),
+            CancellationToken.None);
+
+        Assert.NotEqual(true, result.IsError);
+        using var doc = JsonDocument.Parse(result.Content[0].Text);
+        var root = doc.RootElement;
+
+        Assert.True(root.TryGetProperty("retrievalId", out var ridProp),
+            "remote kb_search empty-results envelope must contain a top-level 'retrievalId' key");
+        Assert.Equal("", ridProp.GetString());
+
+        Assert.True(root.TryGetProperty("results", out var results));
+        Assert.Equal(0, results.GetArrayLength());
+    }
+
+    [Fact]
+    public async Task KbSearch_IncludesRetrievalId_AndTagsSource()
+    {
+        using var conn = SqliteConnection.Open(":memory:");
+        MigrationRunner.RunMigrations(conn);
+
+        var embed = new RecordingFakeEmbedder();
+        var hybrid = new RecordingFakeHybridSearch
+        {
+            NextResult = new[]
+            {
+                MakeResult("kb-1", score: 0.88, rank: 1),
+            },
+        };
+        var log = new RetrievalEventLog(conn);
+
+        var handler = new KbSearchHandler(
+            embed, hybrid,
+            remote: null,
+            scopeDefault: null,
+            retrievalLog: log,
+            syncQueue: null,
+            querySource: "assistant");
+
+        var result = await handler.ExecuteAsync(
+            Args("""{"query":"kb hello"}"""), CancellationToken.None);
+
+        using var doc = JsonDocument.Parse(result.Content[0].Text);
+        Assert.True(doc.RootElement.TryGetProperty("retrievalId", out var rid));
+        Assert.False(string.IsNullOrEmpty(rid.GetString()));
+
+        Assert.Equal("assistant", log.GetEvents(new RetrievalEventQuery()).Single().QuerySource);
+    }
+}

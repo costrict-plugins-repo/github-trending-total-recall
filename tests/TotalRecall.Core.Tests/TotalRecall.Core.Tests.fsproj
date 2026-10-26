@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>TotalRecall.Core.Tests</RootNamespace>
+    <AssemblyName>TotalRecall.Core.Tests</AssemblyName>
+    <IsPackable>false</IsPackable>
+    <GenerateProgramFile>false</GenerateProgramFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="FixtureLoader.fs" />
+    <Compile Include="TokenizerTests.fs" />
+    <Compile Include="DecayTests.fs" />
+    <Compile Include="RankingTests.fs" />
+    <Compile Include="CompactionTests.fs" />
+    <Compile Include="ParsersTests.fs" />
+    <Compile Include="ChunkerTests.fs" />
+    <Compile Include="ConfigTests.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="Expecto" Version="10.2.1" />
+    <PackageReference Include="Expecto.FsCheck" Version="10.2.1" />
+    <PackageReference Include="YoloDev.Expecto.TestSdk" Version="0.14.3" />
+    <PackageReference Include="FsCheck" Version="2.16.6" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\TotalRecall.Core\TotalRecall.Core.fsproj" />
+  </ItemGroup>
+</Project>
