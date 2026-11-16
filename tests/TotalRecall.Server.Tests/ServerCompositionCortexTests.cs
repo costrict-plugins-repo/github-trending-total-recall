@@ -1,0 +1,236 @@
+// tests/TotalRecall.Server.Tests/ServerCompositionCortexTests.cs
+//
+// Task 14 — verify cortex storage mode wiring in ServerComposition.
+// Plus: cortex now runs the embedder-fingerprint migration on its LOCAL vec0
+// index at open (mirrors the sqlite path) — proven without a live cortex server.
+
+namespace TotalRecall.Server.Tests;
+
+using System;
+using System.IO;
+using TotalRecall.Core;
+using TotalRecall.Infrastructure.Embedding;
+using TotalRecall.Infrastructure.Storage;
+using TotalRecall.Infrastructure.Sync;
+using Xunit;
+using MsSqliteConnection = Microsoft.Data.Sqlite.SqliteConnection;
+
+public sealed class ServerCompositionCortexTests
+{
+    [Fact]
+    public void OpenCortex_CreatesRoutingStore()
+    {
+        var handles = ServerComposition.OpenCortexForTest(
+            sqliteDbPath: ":memory:",
+            cortexUrl: "https://cortex.test",
+            cortexPat: "tr_test123");
+
+        Assert.NotNull(handles.Store);
+        Assert.IsType<RoutingStore>(handles.Store);
+    }
+
+    /// <summary>
+    /// The bug this closes: cortex mode unconditionally scanned ~/.claude/skills
+    /// and POSTed every skill found to Cortex's /api/me/skills/import, duplicating
+    /// skills a host tool (e.g. cortex-plugin) already synced down globally. With
+    /// no [skill] section at all, auto-import must default to disabled.
+    /// </summary>
+    [Fact]
+    public void OpenCortex_NoSkillSection_AutoImportDefaultsDisabled()
+    {
+        var home = Path.Combine(Path.GetTempPath(), $"tr-cortex-skill-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(home);
+        var prevHome = Environment.GetEnvironmentVariable("TOTAL_RECALL_HOME");
+        try
+        {
+            Environment.SetEnvironmentVariable("TOTAL_RECALL_HOME", home);
+            File.WriteAllText(Path.Combine(home, "config.toml"), "# no skill section\n");
+
+            using var handles = ServerComposition.OpenCortexForTest(
+                sqliteDbPath: ":memory:",
+                cortexUrl: "https://cortex.test",
+                cortexPat: "tr_test123");
+
+            Assert.False(handles.SkillAutoImportEnabled);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("TOTAL_RECALL_HOME", prevHome);
+            try { Directory.Delete(home, recursive: true); } catch (IOException) { }
+        }
+    }
+
+    [Fact]
+    public void OpenCortex_SkillAutoImportTrue_EnablesUpload()
+    {
+        var home = Path.Combine(Path.GetTempPath(), $"tr-cortex-skill-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(home);
+        var prevHome = Environment.GetEnvironmentVariable("TOTAL_RECALL_HOME");
+        try
+        {
+            Environment.SetEnvironmentVariable("TOTAL_RECALL_HOME", home);
+            File.WriteAllText(Path.Combine(home, "config.toml"), "[skill]\nauto_import = true\n");
+
+            using var handles = ServerComposition.OpenCortexForTest(
+                sqliteDbPath: ":memory:",
+                cortexUrl: "https://cortex.test",
+                cortexPat: "tr_test123");
+
+            Assert.True(handles.SkillAutoImportEnabled);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("TOTAL_RECALL_HOME", prevHome);
+            try { Directory.Delete(home, recursive: true); } catch (IOException) { }
+        }
+    }
+
+    [Fact]
+    public void OpenCortex_SkillAutoImportFalse_DisablesUpload()
+    {
+        var home = Path.Combine(Path.GetTempPath(), $"tr-cortex-skill-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(home);
+        var prevHome = Environment.GetEnvironmentVariable("TOTAL_RECALL_HOME");
+        try
+        {
+            Environment.SetEnvironmentVariable("TOTAL_RECALL_HOME", home);
+            File.WriteAllText(Path.Combine(home, "config.toml"), "[skill]\nauto_import = false\n");
+
+            using var handles = ServerComposition.OpenCortexForTest(
+                sqliteDbPath: ":memory:",
+                cortexUrl: "https://cortex.test",
+                cortexPat: "tr_test123");
+
+            Assert.False(handles.SkillAutoImportEnabled);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("TOTAL_RECALL_HOME", prevHome);
+            try { Directory.Delete(home, recursive: true); } catch (IOException) { }
+        }
+    }
+
+    /// <summary>
+    /// Proves the embedder-fingerprint migration is wired into the cortex
+    /// composition path (OpenCortexCore), not just sqlite/postgres. We seed a
+    /// LOCAL DB that is populated but stamped with a DIFFERENT model, configure
+    /// on_model_change="block", then open cortex pointing at that DB. If the
+    /// migration is wired, opening throws the mismatch exception (the block path
+    /// reads only the embedder Descriptor + _meta, so it needs no live cortex
+    /// server and no ONNX model file). A regression that drops the migration
+    /// call would open cleanly and this test would fail.
+    /// </summary>
+    [Fact]
+    public void OpenCortex_PopulatedLocalDb_StampedDifferentModel_Block_Throws()
+    {
+        var home = Path.Combine(Path.GetTempPath(), $"tr-cortex-mig-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(home);
+        var dbPath = Path.Combine(home, "local.db");
+
+        var prevHome = Environment.GetEnvironmentVariable("TOTAL_RECALL_HOME");
+        var prevDbPath = Environment.GetEnvironmentVariable("TOTAL_RECALL_DB_PATH");
+        try
+        {
+            // Force on_model_change="block" via a user config under TOTAL_RECALL_HOME.
+            Environment.SetEnvironmentVariable("TOTAL_RECALL_HOME", home);
+            Environment.SetEnvironmentVariable("TOTAL_RECALL_DB_PATH", dbPath);
+            File.WriteAllText(
+                Path.Combine(home, "config.toml"),
+                "[embedding]\non_model_change = \"block\"\n");
+
+            // Seed a populated local index stamped with a DIFFERENT (prior) model.
+            var oldE = new FixedDescriptorEmbedder("local", "old-model", "", 384);
+            using (var conn = SqliteConnection.Open(dbPath))
+            {
+                MigrationRunner.RunMigrations(conn);
+                var store = new SqliteStore(conn);
+                store.InsertWithEmbedding(Tier.Warm, ContentType.Memory,
+                    new InsertEntryOpts("seed"), oldE.Embed("seed"));
+                EmbedderFingerprint.Restamp(store, oldE);
+            }
+            MsSqliteConnection.ClearAllPools();
+
+            // Opening cortex must run EnsureCompatibleSqlite on the local index and,
+            // under block + mismatch, throw.
+            Assert.Throws<EmbedderFingerprintMismatchException>(
+                () => ServerComposition.OpenCortexForTest(dbPath, "https://cortex.test", "tr_test123"));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("TOTAL_RECALL_HOME", prevHome);
+            Environment.SetEnvironmentVariable("TOTAL_RECALL_DB_PATH", prevDbPath);
+            MsSqliteConnection.ClearAllPools();
+            try { Directory.Delete(home, recursive: true); } catch (IOException) { }
+        }
+    }
+
+    /// <summary>
+    /// The exact bug this change closes: a cortex DB that was NEVER fingerprint-
+    /// stamped (cortex historically skipped stamping) yet is POPULATED with vectors
+    /// from a prior model — i.e. <c>_meta</c> has no <c>embed.*</c> keys. With
+    /// on_model_change="block", opening cortex must run the migration on the local
+    /// index, observe Unstamped-but-populated, and throw. This proves the cortex
+    /// wiring reaches the NEW branch (not just the already-covered Mismatch path):
+    /// the seeded DB here is deliberately left unstamped.
+    /// </summary>
+    [Fact]
+    public void OpenCortex_PopulatedLocalDb_Unstamped_Block_Throws()
+    {
+        var home = Path.Combine(Path.GetTempPath(), $"tr-cortex-unstamped-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(home);
+        var dbPath = Path.Combine(home, "local.db");
+
+        var prevHome = Environment.GetEnvironmentVariable("TOTAL_RECALL_HOME");
+        var prevDbPath = Environment.GetEnvironmentVariable("TOTAL_RECALL_DB_PATH");
+        try
+        {
+            Environment.SetEnvironmentVariable("TOTAL_RECALL_HOME", home);
+            Environment.SetEnvironmentVariable("TOTAL_RECALL_DB_PATH", dbPath);
+            File.WriteAllText(
+                Path.Combine(home, "config.toml"),
+                "[embedding]\non_model_change = \"block\"\n");
+
+            // Seed a populated local index but DO NOT stamp a fingerprint —
+            // models a cortex DB created before stamping was wired into the path.
+            var oldE = new FixedDescriptorEmbedder("local", "old-model", "", 384);
+            using (var conn = SqliteConnection.Open(dbPath))
+            {
+                MigrationRunner.RunMigrations(conn);
+                var store = new SqliteStore(conn);
+                store.InsertWithEmbedding(Tier.Warm, ContentType.Memory,
+                    new InsertEntryOpts("seed"), oldE.Embed("seed"));
+                // No EmbedderFingerprint.Restamp: _meta has zero embed.* keys → Unstamped.
+            }
+            MsSqliteConnection.ClearAllPools();
+
+            Assert.Throws<EmbedderFingerprintMismatchException>(
+                () => ServerComposition.OpenCortexForTest(dbPath, "https://cortex.test", "tr_test123"));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("TOTAL_RECALL_HOME", prevHome);
+            Environment.SetEnvironmentVariable("TOTAL_RECALL_DB_PATH", prevDbPath);
+            MsSqliteConnection.ClearAllPools();
+            try { Directory.Delete(home, recursive: true); } catch (IOException) { }
+        }
+    }
+
+    /// <summary>IEmbedder with a fully controllable descriptor; Embed returns a
+    /// normalized constant vector so the seeded row is valid for the vec0 table.</summary>
+    private sealed class FixedDescriptorEmbedder : IEmbedder
+    {
+        public FixedDescriptorEmbedder(string provider, string model, string revision, int dims)
+            => Descriptor = new EmbedderDescriptor(provider, model, revision, dims);
+
+        public EmbedderDescriptor Descriptor { get; }
+
+        public float[] Embed(string text)
+        {
+            var a = new float[Descriptor.Dimensions];
+            for (var i = 0; i < a.Length; i++) a[i] = 1.0f;
+            var n = (float)Math.Sqrt(a.Length);
+            for (var i = 0; i < a.Length; i++) a[i] /= n;
+            return a;
+        }
+    }
+}

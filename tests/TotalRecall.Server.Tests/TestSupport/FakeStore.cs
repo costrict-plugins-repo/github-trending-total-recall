@@ -1,0 +1,318 @@
+// Lightweight IStore fake for Plan 4 handler tests. Records calls to
+// Insert/Update/Delete and supports a pre-seeded Get lookup table keyed by
+// (tier, type, id). Methods that individual handler tests do not exercise
+// throw NotImplementedException so accidental dependencies show up loudly.
+//
+// Tasks 4.6/4.7 used only Insert; Task 4.8 (get/update/delete handlers)
+// needs a functioning Get, Update, and Delete surface.
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using TotalRecall.Core;
+using TotalRecall.Infrastructure.Storage;
+
+namespace TotalRecall.Server.Tests.TestSupport;
+
+public sealed class FakeStore : IStore
+{
+    public sealed record InsertCall(Tier Tier, ContentType Type, InsertEntryOpts Opts);
+    public sealed record UpdateCall(Tier Tier, ContentType Type, string Id, UpdateEntryOpts Opts);
+    public sealed record DeleteCall(Tier Tier, ContentType Type, string Id);
+    public sealed record GetCall(Tier Tier, ContentType Type, string Id);
+
+    public List<InsertCall> InsertCalls { get; } = new();
+    public List<UpdateCall> UpdateCalls { get; } = new();
+    public List<DeleteCall> DeleteCalls { get; } = new();
+    public List<GetCall> GetCalls { get; } = new();
+
+    public string NextInsertId { get; set; } = "entry-123";
+
+    /// <summary>
+    /// When true, each call to <see cref="Insert"/> or
+    /// <see cref="InsertWithEmbedding"/> returns
+    /// <c>"{NextInsertId}-{counter}"</c> so callers receive distinguishable
+    /// ids without the test needing to update <see cref="NextInsertId"/>
+    /// between calls. Defaults to false so existing tests are unaffected.
+    /// </summary>
+    public bool AutoIncrementInsertIds { get; set; }
+    private int _insertCounter;
+
+    /// <summary>
+    /// Pre-seeded entries keyed by (tier, type, id). Tests call Seed(...)
+    /// to place rows before invoking a handler.
+    /// </summary>
+    public Dictionary<(Tier, ContentType, string), Entry> Entries { get; } = new();
+
+    /// <summary>
+    /// Synthetic rowid assigned to each seeded or inserted entry so
+    /// <see cref="GetInternalKey"/> can return a stable value that behaves
+    /// like the SQLite-allocated rowid in production. Monotonic; reused
+    /// after deletion isn't modeled because no handler test needs it.
+    /// </summary>
+    public Dictionary<(Tier, ContentType, string), long> Rowids { get; } = new();
+    private long _nextRowid = 1;
+
+    /// <summary>
+    /// Ordered entry lists per (tier, type) slot. Populated via
+    /// <see cref="SeedList"/>; consumed by <see cref="List"/>. Kept separate
+    /// from the id-keyed <see cref="Entries"/> dictionary so tests that only
+    /// exercise Get/Insert/Delete are unaffected.
+    /// </summary>
+    public Dictionary<(Tier, ContentType), List<Entry>> ListSlots { get; } = new();
+
+    public void Seed(Tier tier, ContentType type, Entry entry)
+    {
+        Entries[(tier, type, entry.Id)] = entry;
+        if (!Rowids.ContainsKey((tier, type, entry.Id)))
+            Rowids[(tier, type, entry.Id)] = _nextRowid++;
+    }
+
+    public void SeedList(Tier tier, ContentType type, params Entry[] entries)
+    {
+        if (!ListSlots.TryGetValue((tier, type), out var slot))
+        {
+            slot = new List<Entry>();
+            ListSlots[(tier, type)] = slot;
+        }
+        slot.AddRange(entries);
+        // Assign synthetic rowids so GetInternalKey works for SeedList-only entries
+        // (KbRefreshHandlerTests and similar exercise children that are only
+        // populated via SeedList, not Seed).
+        foreach (var e in entries)
+        {
+            if (!Rowids.ContainsKey((tier, type, e.Id)))
+                Rowids[(tier, type, e.Id)] = _nextRowid++;
+        }
+    }
+
+    public string Insert(Tier tier, ContentType type, InsertEntryOpts opts)
+    {
+        InsertCalls.Add(new InsertCall(tier, type, opts));
+        var id = AutoIncrementInsertIds ? $"{NextInsertId}-{++_insertCounter}" : NextInsertId;
+        Rowids[(tier, type, id)] = _nextRowid++;
+        return id;
+    }
+
+    public sealed record InsertWithEmbeddingCall(Tier Tier, ContentType Type, InsertEntryOpts Opts, float[] Embedding);
+    public List<InsertWithEmbeddingCall> InsertWithEmbeddingCalls { get; } = new();
+
+    public string InsertWithEmbedding(
+        Tier tier, ContentType type, InsertEntryOpts opts, ReadOnlyMemory<float> embedding)
+    {
+        InsertWithEmbeddingCalls.Add(new InsertWithEmbeddingCall(tier, type, opts, embedding.ToArray()));
+        // Mirror the real store: allocate a rowid under the same monotonic
+        // counter so GetInternalKey works on the fresh id. Does NOT model
+        // transactional rollback — tests that need to exercise the rollback
+        // path use the real SqliteStore against :memory:.
+        var id = AutoIncrementInsertIds ? $"{NextInsertId}-{++_insertCounter}" : NextInsertId;
+        Rowids[(tier, type, id)] = _nextRowid++;
+        return id;
+    }
+
+    public Entry? Get(Tier tier, ContentType type, string id)
+    {
+        GetCalls.Add(new GetCall(tier, type, id));
+        return Entries.TryGetValue((tier, type, id), out var e) ? e : null;
+    }
+
+    public long? GetInternalKey(Tier tier, ContentType type, string id)
+    {
+        return Rowids.TryGetValue((tier, type, id), out var r) ? r : null;
+    }
+
+    public void Update(Tier tier, ContentType type, string id, UpdateEntryOpts opts)
+    {
+        UpdateCalls.Add(new UpdateCall(tier, type, id, opts));
+    }
+
+    public void Delete(Tier tier, ContentType type, string id)
+    {
+        DeleteCalls.Add(new DeleteCall(tier, type, id));
+        OrderLog?.Add("store.Delete");
+        Entries.Remove((tier, type, id));
+        Rowids.Remove((tier, type, id));
+    }
+
+    /// <summary>
+    /// Opt-in cross-fake call-order log. When set (by a test), deletion
+    /// methods on this fake and any sibling <see cref="FakeVectorSearch"/>
+    /// sharing the same list append a tag each time they are invoked, so
+    /// the test can assert relative ordering of operations across the
+    /// store + vec boundary. Left null by default so existing tests see
+    /// no behavior change.
+    /// </summary>
+    public List<string>? OrderLog { get; set; }
+
+    public ListEntriesOpts? LastListOpts { get; private set; }
+
+    // Tier model v2 (Task 5) — sticky is hot-only store-side state, keyed by
+    // (ContentType, id). SetSticky/IsSticky mirror the real store; List honors
+    // StickyOnly/ExcludeSticky for Tier.Hot.
+    private readonly HashSet<(ContentType, string)> _sticky = new();
+
+    public void SetSticky(ContentType type, string id, bool sticky)
+    {
+        if (sticky) _sticky.Add((type, id));
+        else _sticky.Remove((type, id));
+    }
+
+    public bool IsSticky(ContentType type, string id) => _sticky.Contains((type, id));
+
+    public IReadOnlyList<Entry> List(Tier tier, ContentType type, ListEntriesOpts? opts = null)
+    {
+        LastListOpts = opts;
+        // Prefer an explicit SeedList slot; otherwise fall back to the id-keyed
+        // Entries dict so entries placed/moved via Seed/Move (e.g. by the pin
+        // handler moving an entry into hot) are visible to List too.
+        IEnumerable<Entry> src;
+        if (ListSlots.TryGetValue((tier, type), out var slot))
+            src = slot;
+        else
+            src = Entries.Where(kv => kv.Key.Item1.Equals(tier) && kv.Key.Item2.Equals(type))
+                         .Select(kv => kv.Value);
+        // Sticky filter (hot-only).
+        if (tier.IsHot)
+        {
+            if (opts?.StickyOnly == true)
+                src = src.Where(e => _sticky.Contains((type, e.Id)));
+            else if (opts?.ExcludeSticky == true)
+                src = src.Where(e => !_sticky.Contains((type, e.Id)));
+        }
+        if (opts?.ParentId is string pid)
+            src = src.Where(e =>
+                Microsoft.FSharp.Core.FSharpOption<string>.get_IsSome(e.ParentId)
+                && e.ParentId.Value == pid);
+        if (opts?.EntryType is { } et)
+            src = src.Where(e => e.EntryType.Equals(et));
+        if (opts?.Source is string sourceFilter)
+            src = src.Where(e =>
+                Microsoft.FSharp.Core.FSharpOption<string>.get_IsSome(e.Source)
+                && e.Source.Value == sourceFilter);
+        // Honor the OrderBy hint before applying Limit so top-N results are
+        // globally correct (mirrors what the real SqliteStore does in SQL).
+        // Supports the three columns used by RecentQuery: created_at, updated_at,
+        // last_accessed_at — all DESC. Unrecognized patterns preserve insertion order.
+        if (opts?.OrderBy is string orderBy)
+        {
+            var parts = orderBy.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            var col = parts[0];
+            var desc = parts.Length < 2 || !parts[1].Equals("ASC", StringComparison.OrdinalIgnoreCase);
+            IOrderedEnumerable<Entry> ordered = col switch
+            {
+                "updated_at" => desc
+                    ? src.OrderByDescending(e => e.UpdatedAt)
+                    : src.OrderBy(e => e.UpdatedAt),
+                "last_accessed_at" => desc
+                    ? src.OrderByDescending(e => e.LastAccessedAt)
+                    : src.OrderBy(e => e.LastAccessedAt),
+                _ => desc
+                    ? src.OrderByDescending(e => e.CreatedAt)
+                    : src.OrderBy(e => e.CreatedAt),
+            };
+            src = ordered;
+        }
+        if (opts?.Limit is int lim) src = src.Take(lim);
+        return src.ToList();
+    }
+
+    /// <summary>
+    /// Pre-seeded counts per (tier, type). Consumed by <see cref="Count"/>.
+    /// Task 4.11 StatusHandler relies on this. Defaults to 0 when not seeded.
+    /// </summary>
+    public Dictionary<(Tier, ContentType), int> Counts { get; } = new();
+
+    /// <summary>
+    /// Pre-seeded metadata-filtered slots. Key includes a sorted-string
+    /// rendering of the filter so multiple filters on the same (tier, type)
+    /// can coexist. Task 4.11 StatusHandler uses a
+    /// <c>{"type":"collection"}</c> filter against cold_knowledge.
+    /// </summary>
+    public Dictionary<(Tier, ContentType, string), List<Entry>> ListByMetadataSlots { get; } = new();
+
+    public void SeedCount(Tier tier, ContentType type, int count)
+    {
+        Counts[(tier, type)] = count;
+    }
+
+    public void SeedListByMetadata(
+        Tier tier,
+        ContentType type,
+        IReadOnlyDictionary<string, string> metadataFilter,
+        params Entry[] entries)
+    {
+        var key = (tier, type, FilterKey(metadataFilter));
+        if (!ListByMetadataSlots.TryGetValue(key, out var slot))
+        {
+            slot = new List<Entry>();
+            ListByMetadataSlots[key] = slot;
+        }
+        slot.AddRange(entries);
+    }
+
+    public int Count(Tier tier, ContentType type)
+    {
+        if (Counts.TryGetValue((tier, type), out var n)) return n;
+        // Fall back to id-keyed Entries so entries placed/moved via Seed/Move
+        // (e.g. the pin handler moving into hot) are counted without SeedCount.
+        return Entries.Count(kv => kv.Key.Item1.Equals(tier) && kv.Key.Item2.Equals(type));
+    }
+
+    public int CountKnowledgeCollections() =>
+        throw new NotImplementedException();
+
+    public IReadOnlyList<Entry> ListByMetadata(
+        Tier tier,
+        ContentType type,
+        IReadOnlyDictionary<string, string> metadataFilter,
+        ListEntriesOpts? opts = null)
+    {
+        var key = (tier, type, FilterKey(metadataFilter));
+        if (!ListByMetadataSlots.TryGetValue(key, out var slot))
+            return Array.Empty<Entry>();
+        IEnumerable<Entry> src = slot;
+        if (opts?.Limit is int lim) src = src.Take(lim);
+        return src.ToList();
+    }
+
+    private static string FilterKey(IReadOnlyDictionary<string, string> filter)
+    {
+        var parts = filter
+            .OrderBy(kv => kv.Key, StringComparer.Ordinal)
+            .Select(kv => kv.Key + "=" + kv.Value);
+        return string.Join(";", parts);
+    }
+
+    public string? FindByContent(Tier tier, ContentType type, string content)
+    {
+        foreach (var kv in Entries)
+        {
+            if (kv.Key.Item1.Equals(tier) && kv.Key.Item2.Equals(type) &&
+                kv.Value.Content == content)
+                return kv.Value.Id;
+        }
+        return null;
+    }
+
+    public sealed record MoveCall(Tier FromTier, ContentType FromType, Tier ToTier, ContentType ToType, string Id);
+
+    public List<MoveCall> MoveCalls { get; } = new();
+
+    public void Move(Tier fromTier, ContentType fromType, Tier toTier, ContentType toType, string id)
+    {
+        MoveCalls.Add(new MoveCall(fromTier, fromType, toTier, toType, id));
+        if (Entries.TryGetValue((fromTier, fromType, id), out var e))
+        {
+            Entries.Remove((fromTier, fromType, id));
+            Entries[(toTier, toType, id)] = e;
+        }
+        // Mirror production store.Move: the row moves to a new table and
+        // therefore gets a new rowid in that table. Reuse the same
+        // monotonic counter so tests that compare rowids across moves
+        // observe distinct values.
+        if (Rowids.Remove((fromTier, fromType, id)))
+            Rowids[(toTier, toType, id)] = _nextRowid++;
+    }
+
+    public void UpdateInjectionCounts(IReadOnlyList<(Tier tier, ContentType type, string id)> entries) { }
+}

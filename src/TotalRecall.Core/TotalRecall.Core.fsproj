@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>TotalRecall.Core</RootNamespace>
+    <AssemblyName>TotalRecall.Core</AssemblyName>
+    <IsAotCompatible>true</IsAotCompatible>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Types.fs" />
+    <Compile Include="SyncStamp.fs" />
+    <Compile Include="SyncRecord.fs" />
+    <Compile Include="SyncValidation.fs" />
+    <Compile Include="SyncMerge.fs" />
+    <Compile Include="Config.fs" />
+    <Compile Include="SyncGit.fs" />
+    <Compile Include="SyncTree.fs" />
+    <Compile Include="SyncManifest.fs" />
+    <Compile Include="SyncIdentity.fs" />
+    <Compile Include="SyncPublic.fs" />
+    <Compile Include="SyncSettingsGuard.fs" />
+    <Compile Include="SyncSetup.fs" />
+    <Compile Include="Tokenizer.fs" />
+    <Compile Include="Decay.fs" />
+    <Compile Include="Ranking.fs" />
+    <Compile Include="Compaction.fs" />
+    <Compile Include="Parsers.fs" />
+    <Compile Include="Chunker.fs" />
+  </ItemGroup>
+</Project>

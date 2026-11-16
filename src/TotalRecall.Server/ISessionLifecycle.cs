@@ -1,0 +1,57 @@
+// src/TotalRecall.Server/ISessionLifecycle.cs
+//
+// Plan 4 Task 4.3 — DI seam for the session-init pipeline. The MCP wire
+// surface (Task 4.10's session_start handler) and the McpServer's
+// notifications/initialized fire-and-forget hook both go through this
+// interface so unit tests can swap in a hand-rolled fake.
+
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace TotalRecall.Server;
+
+/// <summary>
+/// Lazy, idempotent session bootstrap. The first call to
+/// <see cref="EnsureInitializedAsync"/> runs the host-importer sweep, computes
+/// the tier summary, assembles hot-tier context + actionable hints, and caches
+/// the resulting <see cref="SessionInitResult"/>. Every subsequent call
+/// (regardless of caller — initialized notification, session_start tool,
+/// session_context tool) returns the cached value cheaply.
+///
+/// It runs the importers (project docs
+/// included), the warm sweep and hot-tier assembly, pins the per-session
+/// config snapshot, and reports retrieval regressions against the previous
+/// snapshot. It also runs the version-gated first-run smoke test and reports it
+/// in <c>SessionInitResult.SmokeTest</c> (null when it is not due or is skipped).
+/// </summary>
+public interface ISessionLifecycle
+{
+    /// <summary>
+    /// Runs session initialization on first invocation, returns the cached
+    /// result on every call thereafter. Idempotent; safe to call from
+    /// multiple entry points (notification handler, tool handler, etc.).
+    /// </summary>
+    Task<SessionInitResult> EnsureInitializedAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// True after <see cref="EnsureInitializedAsync"/> has completed at least
+    /// once. Lets handlers branch on whether they hit the cached path.
+    /// </summary>
+    bool IsInitialized { get; }
+
+    /// <summary>
+    /// Stable session identifier generated at construction. Exposed so
+    /// handlers like <c>session_end</c> can return the session id without
+    /// having to round-trip through <see cref="EnsureInitializedAsync"/>.
+    /// Task 4.10 backfill.
+    /// </summary>
+    string SessionId { get; }
+
+    /// <summary>
+    /// Phase 1 Step 4 — refreshes hot-tier context mid-session. Runs warm
+    /// sweep, re-assembles context, and returns change summary with
+    /// efficiency stats. Accepts an optional task description for
+    /// task-aware ranking (Phase 2).
+    /// </summary>
+    Task<RefreshResult> RefreshAsync(string? task = null, CancellationToken ct = default);
+}

@@ -1,0 +1,118 @@
+# total-recall on Claude Code
+
+## Install
+
+No stop condition: Claude Code is the primary host.
+
+### Plugin (recommended)
+
+The plugin gives Claude Code the MCP server, the startup instructions, the per-prompt pinned-directive floor and the `/total-recall:commands` skill. Tell the user that these two commands add a third-party marketplace and enable an MCP server and hooks, one of which runs on every prompt; the user's request to install the plugin covers them. Run both commands in a shell:
+
+```sh
+claude plugin marketplace add strvmarv/total-recall-marketplace
+claude plugin install total-recall@strvmarv-total-recall-marketplace
+```
+
+The marketplace entry is the repository URL with no ref, so the install takes the default branch. It carries no engine binary: the first launch downloads and verifies it for the version in that tree's `package.json` (see [first run](../first-run.md#provisioning-on-first-launch)).
+
+If the `claude` command is not found or either command exits non-zero, stop. The user can type the same two steps as slash commands inside a Claude Code session (a User step); wait for them to say both have run, then make the permission offer below and continue at Verify:
+
+```
+/plugin marketplace add strvmarv/total-recall-marketplace
+/plugin install total-recall@strvmarv-total-recall-marketplace
+```
+
+The plugin path changes nothing outside Claude Code (the two commands update Claude Code's own plugin registry), so there is nothing else to report there. After the install, offer the permission rule. **Ask first**: tell the user that the rule `mcp__plugin_total-recall_total-recall__*` lets Claude Code call every total-recall tool without asking each time, including the tools that write and delete memories. On a yes, make the edit the `setup` section of `skills/commands/SKILL.md` describes: add that one rule to `permissions.allow` in `~/.claude/settings.json` (under `$CLAUDE_CONFIG_DIR` instead of `~/.claude` if that is set, the same place the plugin directory is under), create the file if it is missing, and change nothing else in it. Check the file without printing it. The path below is `$HOME/.claude/settings.json`; if `CLAUDE_CONFIG_DIR` is set use `$CLAUDE_CONFIG_DIR/settings.json` instead, and in PowerShell use `$env:USERPROFILE\.claude\settings.json` (or `$env:CLAUDE_CONFIG_DIR\settings.json`):
+
+```sh
+node -e "const fs=require('fs'); const f=process.argv[1]; if (fs.existsSync(f)===false) { console.log('missing') } else { try { const j=JSON.parse(fs.readFileSync(f,'utf8').replace(/^\uFEFF/,'')); const a=j && j.permissions && j.permissions.allow; console.log(Array.isArray(a) ? (a.includes(process.argv[2]) ? 'present' : 'absent, ' + a.length + ' items') : 'no allow array') } catch (e) { console.log('unreadable') } }" "$HOME/.claude/settings.json" 'mcp__plugin_total-recall_total-recall__*'
+```
+
+If it prints `present`, do nothing. If it prints `absent`, insert the string as the first item of the `permissions.allow` array by text insertion (with a comma after it if the count is above 0), following the edit rules in `INSTALL.md` (copy first, parse check after). If it prints `missing`, create the file holding exactly `{"permissions":{"allow":["mcp__plugin_total-recall_total-recall__*"]}}`. If it prints `unreadable` (for example the file has comments) or `no allow array`, do not edit: tell the user to run `/total-recall:commands setup` themselves. Do not run the edit if you cannot place it without printing the other rules.
+
+### MCP server only (no plugin)
+
+This gives the tools and nothing else: no hooks, no startup instructions, no floor, no skills.
+
+**Ask first.** This install runs the package's install script, which may change other tools on the machine: Hermes, Kiro, Cline, Windsurf, Gemini CLI, Zed, VS Code and Copilot CLI's MCP config. Beyond adding an MCP entry it can switch Hermes's memory provider and add a Gemini CLI hook that runs on every prompt. Tell the user this and get a yes before running it; the user asking you to install total-recall is not that yes. On a no, use the form that skips the install script, given below. The detail is in [What the install script changes](https://raw.githubusercontent.com/strvmarv/total-recall/main/docs/npm-postinstall.md).
+
+```sh
+npm install -g @strvmarv/total-recall
+```
+
+The form that skips the install script changes nothing else. The install script configures nothing for Claude Code, so nothing is lost by skipping it here:
+
+```sh
+npm install -g --ignore-scripts @strvmarv/total-recall
+```
+
+Then give the user this entry to add; this is a User step, not yours to edit. Claude Code rewrites `~/.claude.json` itself and the file also holds other sensitive content. The entry goes in the `mcpServers` object that is a direct child of the file's root (not one under `projects`), which the user creates if it is missing. If `CLAUDE_CONFIG_DIR` is set, where Claude Code keeps this file was not checked: tell the user and ask which file they mean. If the user already has a `total-recall` entry there, they keep it and tell you.
+
+```json
+{
+  "mcpServers": {
+    "total-recall": {
+      "command": "total-recall"
+    }
+  }
+}
+```
+
+Nothing on this path tells the model to call `session_start`. Add the startup instructions as a user step (see User steps).
+
+## User steps
+
+1. Plugin path: start a new Claude Code session; MCP tools and hooks appear only in a new session.
+2. Plugin path, if the allow rule was declined: tell the user that, in a mode that never asks, the tools stay blocked until they run `/total-recall:commands setup` and restart the session.
+3. MCP-only path: add the entry above to `~/.claude.json`, then restart Claude Code so it reads the file (inferred, not observed), and tell the agent when done.
+4. MCP-only path: nothing delivers the startup instructions. This is a user step; do not write the file yourself. Fetch the file linked here and give the user the text to add to your harness's persistent instructions file. The text is the body, below its front matter, of [`.kiro/steering/total-recall.md`](https://raw.githubusercontent.com/strvmarv/total-recall/main/.kiro/steering/total-recall.md); its "Sticky directives" paragraph describes Kiro's hook and does not apply here.
+
+## Verify
+
+Plugin path, now:
+
+```sh
+ls ~/.claude/plugins/cache/strvmarv-total-recall-marketplace/total-recall/
+node ~/.claude/plugins/cache/strvmarv-total-recall-marketplace/total-recall/<version>/bin/start.js --version
+```
+
+`<version>` is the directory the first command lists (if more than one is listed, use the newest and tell the user). Expected: `total-recall <version>`, which is also the version `npm view @strvmarv/total-recall version` reports unless the default branch is ahead of the last release. This proves the engine and the plugin files, not that Claude Code has the plugin enabled: report that as pending until the next session. The first run downloads and verifies the engine (about 100 MB), so it can take a while; a later run answers at once. If `CLAUDE_CONFIG_DIR` is set, the plugin directory is under it instead of `~/.claude`.
+
+MCP-only path, now: `total-recall --version` should print the version that `npm view @strvmarv/total-recall version` reports. If the user comes back in this session after adding the entry, run the read command from Rules in `INSTALL.md` on `~/.claude.json` with the key `mcpServers`; `total-recall present: true` is a check, anything else is pending. If they do not, report the entry as pending. A bare `total-recall` on PATH can be an older copy than the one another harness runs.
+
+In the next session, the user pastes the check prompt from `INSTALL.md`, Step 4, and should see the tier counts and the database path.
+
+## What you get
+
+Plugin path:
+
+- The `total-recall` MCP server, started from the plugin's `.mcp.json` (`node ${CLAUDE_PLUGIN_ROOT}/bin/start.js`).
+- The startup instructions and the capture, retrieve and feedback rules, delivered by a `SessionStart` hook (`startup`, `resume`, `clear`, `compact`) from `hooks/hooks.json`.
+- The pinned-directive floor on every prompt (`UserPromptSubmit` hook), by the adaptive throttle described in `AGENTS.md`.
+- No `SessionEnd` hook. Claude Code runs one but never shows what it prints, so a reminder at session end could not reach anyone (observed, see Evidence). The compaction reminder is the `hot_tier_compaction_suggested` hint that `session_start` returns when the hot tier holds at least `tiers.hot.compaction_hint_threshold` entries (default 5), which the startup instructions tell the model to surface at the next session start, plus one nudge per session from the pinned-floor hook; both reach the user through the model.
+- A what's-new notice: once per version, the `SessionStart` hook shows one line ("total-recall 4.8.0: <summary> All releases: <link>", or "total-recall updated 4.7.0 -> 4.8.0: ...") as a `systemMessage` beside the startup instructions. It is shown for `startup`, `resume` and `clear`, not for `compact`. The hook runs `hooks/session-start/whats-new.js`, which first writes `<data directory>/whats-new/direct-claude-code.json` (`{"at": <UTC time>}`; refreshed on every source, `compact` included) so the engine does not tell the model to relay the same line, then runs the provisioned engine as `whats-new --host claude-code --format claude-code` and keeps its answer only if it is an object whose `systemMessage` is a single-line string of at most 1000 characters without control characters (other members are ignored). The whole step has one 2.5 second deadline (the script, with a `timeout 4` around it where GNU `timeout` exists), never downloads the engine, writes nothing and runs no engine when the data directory cannot be resolved, and on any failure leaves the hook's output as it was. In the first session after a plugin update on a git-sourced install the engine is not provisioned yet, so there is no notice then; it appears once the engine exists. A third line, once the host was told its version, says a newer release exists ("total-recall 4.9.0 is available (you have 4.8.0): <summary> Update: <how> More: <link>", where <how> is `/total-recall:commands update`); it appears once per release, at most one notice is shown per start, and it comes from a check the engine makes in the background (turn that off with `updates.check = false`; see [configuration](../configuration.md)), so a release found mid-session shows at the next start. `updates.notice = false` turns off the whole notice, this line included (see [configuration](../configuration.md)). With the MCP-only path (no plugin hook) there is no stamp, and the model relays the line from `session_start` instead.
+- The skill `commands` (`/total-recall:commands <subcommand>`). The plugin's `skills/` directory also holds `using-total-recall` and `develop` (read from the directory listing, not run).
+- Updating: run `/total-recall:commands update`, which detects how the plugin is installed and gives the steps. For the plugin, that is the `/plugin` update of `total-recall` from the `strvmarv-total-recall-marketplace` marketplace, then `/reload-plugins`. For the MCP-only path, run `npm install -g @strvmarv/total-recall` again.
+
+MCP-only path: the MCP tools and nothing else.
+
+## Known gaps
+
+- Nothing here was observed in a Claude Code session started after a marketplace install; the checks above are the engine and the plugin directory, and the session observations in Evidence used `claude --plugin-dir` on a checkout.
+- In a permission mode that never asks, the plugin's tools are blocked until the allow rule is in place.
+- The MCP-only path has no instructions, no floor and no skills.
+- The what's-new notice was seen in an interactive Claude Code session (see Evidence), not in `claude -p`, where a `SessionStart` `systemMessage` arrives only as a `hook_response` event of `--output-format stream-json`.
+- The compaction reminder reaches the user only if the model follows the startup instructions: Opus 5.5 relayed it in the runs below, but Haiku 5.5 answered the first message without calling `session_start` in the one run made, so it announced nothing.
+
+## Evidence
+
+Observed on Claude Code 2.1.301, macOS arm64, Node 24.18, npm 11.16, with `CLAUDE_CONFIG_DIR` redirected to a throwaway directory: `claude plugin marketplace add strvmarv/total-recall-marketplace` and `claude plugin install total-recall@strvmarv-total-recall-marketplace` both exit 0 and install version 4.7.0 under `plugins/cache/strvmarv-total-recall-marketplace/total-recall/4.7.0/`, with no `binaries/` directory. `node <that directory>/bin/start.js --version` then downloaded, verified and extracted the engine and printed `total-recall 4.7.0`; `status` printed the tier, database and embedding tables. The marketplace entry (`"source": {"source": "url", "url": "https://github.com/strvmarv/total-recall.git"}`, no ref) was read from the marketplace repository.
+
+Observed on Claude Code 2.1.325, Linux x64, with the plugin loaded from a checkout of the repository (`claude --plugin-dir <checkout>`, `TOTAL_RECALL_HOME` set to a throwaway directory, interactive sessions in a PTY, and `claude -p`; #97):
+
+- A `SessionEnd` hook that exits 0 runs (it wrote a marker file) but nothing it prints is displayed: a JSON `systemMessage`, plain stdout and stderr were all invisible after `/exit` and in `claude -p`. One that exits 1 or 2 is shown as `SessionEnd hook [<command>] failed: <stderr>` after the "Resume this session with:" line. This is why the plugin registers no `SessionEnd` hook.
+- A `SessionStart` hook's `systemMessage` is displayed as `SessionStart:startup says: <message>`. The what's-new line appeared this way on the first start with a new data directory (`total-recall 4.8.0: <summary> All releases: <link>`).
+- With 6 hot-tier entries (the threshold is 5), the startup announcement of Opus 5.5 carried the suggestion to run `/total-recall:commands compact` in two runs, worded differently each time ("the 6 hot entries haven't been compacted yet. You can run /total-recall:commands compact to summarize them into the warm tier"). With 3 hot-tier entries the announcement listed the tiers and made no suggestion.
+- A database that has never run `session_start` keeps hot-tier entries only until the one-time tier migration of its first `session_start` moves them to warm (`TierV2DataMigration`). In a run on such a database the model said a startup notice reported 6 uncompacted entries (the pinned-floor nudge, computed when the first prompt was submitted) while the tier summary showed none; seed a test store after a first start.
+
+Not observed: the first Claude Code session after the install, whether `claude -p` shows the `systemMessage` of a `SessionStart` hook as text (it arrives as a `hook_response` event in `--output-format stream-json`), a `SessionEnd` hook on exits other than `/exit` (Ctrl+C, Ctrl+D, closing the terminal), macOS and Windows for all of the above, the client name Claude Code sends in its MCP `initialize` (expected `claude-code`; the shim passes it to the engine as the `host` argument of `session_start`, and if it differs the user can see the notice twice, once directly and once relayed, until the engine's table is corrected), the allow-rule edit, the MCP-only path (its entry and its steps come from the earlier `INSTALL.md` and from `skills/commands/SKILL.md`; the restart step is inferred), the `SessionStart` hook on the `resume`, `clear` and `compact` sources (the `startup` source and the `UserPromptSubmit` hook ran in the session observations above) and the extra skills (from the plugin's `skills/` directory listing, not run).

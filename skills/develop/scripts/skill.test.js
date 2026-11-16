@@ -1,0 +1,721 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { goldenNames, readGolden } from './golden.js';
+import { parseArg } from './args.js';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const SKILL_DIR = path.join(HERE, '..');
+const REPO = path.join(SKILL_DIR, '..', '..');
+const AGENTS_DIR = path.join(REPO, 'agents');
+const ORIGIN = 'strvmarv/total-recall';
+
+// Task 18 sets this to true once every skill file exists; it activates the coverage assertions.
+const COMPLETE = true;
+
+// Later tasks add one entry each. Every listed `## ` heading must be present, every listed golden
+// must parse, and every relative link in a listed file must resolve.
+const FILES = {
+  'SKILL.md': {
+    headings: [
+      'Routing',
+      'Issue entry',
+      'Hosts',
+      'Preflight',
+      'Overrides of superpowers defaults',
+      'Worktrees',
+      'Progress',
+      'Memory',
+      'Commits and PRs',
+      'Files',
+    ],
+    goldens: ['routing', 'pinned-commands'],
+  },
+  'ticket-standard.md': {
+    headings: [
+      'Is it one ticket',
+      'Problem before solution',
+      'Acceptance criteria',
+      'Scope',
+      'Ready',
+      'Shape by type',
+      'Title, labels and type',
+      'Repository overrides',
+      'Review grades',
+      'Markers',
+    ],
+    goldens: [],
+  },
+  'handoff.md': {
+    headings: [
+      'Hashing and regions',
+      'The issue after Define',
+      'Checkpoints',
+      'Trust',
+      'Resume and routing',
+      'Re-approval',
+      'After the PR',
+    ],
+    goldens: [
+      'normalize-pairs', 'body-pairs', 'region-cases', 'fence-cases', 'limit-cases', 'neutralize-cases',
+      'parse-cases', 'validate-cases', 'carry-cases', 'readback-cases',
+      'perm-cases', 'login-cases', 'comment-count-cases', 'pin-cases', 'flatten-cases', 'flatten-fail-cases',
+      'fetch-commands', 'pages-cases', 'history-cases', 'write-access-cases', 'select-cases',
+      'position-cases', 'task-count-cases', 'tasks-for-cases', 'live-cases', 'route-cases',
+    ],
+  },
+  'define.md': {
+    headings: [
+      'Fetch',
+      'Claim',
+      'Worktree',
+      'Brainstorm',
+      'Plan track',
+      'Parent track',
+      'Small track',
+      'Sign-off',
+      'Publish',
+      'Wrap-up',
+      'Rules',
+    ],
+    goldens: [],
+  },
+  'deliver.md': {
+    headings: [
+      'Common steps',
+      'Plan track',
+      'Small track',
+      'Parent track',
+      'Finish and close-out',
+      'Merged close-out',
+      'Ensure-stubs',
+      'After the PR',
+      'Status mode',
+    ],
+    goldens: [],
+  },
+  'review-contract.md': {
+    headings: ['Dispatch frame', 'Loop rules', 'The final loop', 'Self-review mode', 'Agents'],
+    goldens: [],
+  },
+  'blockers.md': {
+    headings: ['Stop for these', 'Decide and continue', 'At a blocker'],
+    goldens: [],
+  },
+  'profile.md': {
+    headings: ['Format', 'Loading', 'Verify blocks', 'Initialize'],
+    goldens: ['profile-cases'],
+  },
+  'tutorial.md': {
+    h1: '# develop',
+    maxLines: 60,
+    headings: [],
+    goldens: [],
+  },
+};
+
+// Scripts that are libraries, not CLIs: no SUBCOMMANDS export, never called from a shell.
+const LIBRARIES = ['golden.js', 'pages.js'];
+
+// Whole-token match: the word after a CLI script name must be exactly a subcommand of that script.
+const CLI_RE = /\b(regions|checkpoints|counted|history|route|args|ghpin|profile)\.js[ \t]+([A-Za-z][\w-]*)(?![\w-])/g;
+
+// Task 18's home table: [file, `## ` section, script, subcommands]; each subcommand's mention must
+// appear inside that section of that file.
+const HOME = [
+  ['SKILL.md', 'Preflight', 'ghpin', ['scratch', 'cleanup', 'pick', 'command', 'run']],
+  ['SKILL.md', 'Issue entry', 'args', ['parse']],
+  ['define.md', 'Plan track', 'regions', ['neutralize', 'fence']],
+  ['handoff.md', 'Hashing and regions', 'regions', ['body-json', 'body', 'ac', 'approach']],
+  ['handoff.md', 'Checkpoints', 'checkpoints', ['validate', 'carry', 'format', 'readback']],
+  ['handoff.md', 'Trust', 'counted', ['select', 'write-access', 'permissions']],
+  ['handoff.md', 'Re-approval', 'history', ['find']],
+  ['deliver.md', 'Common steps', 'route', ['route', 'live', 'position', 'count-tasks', 'count-cycles', 'tasks-for']],
+  ['profile.md', 'Loading', 'profile', ['parse']],
+  ['profile.md', 'Verify blocks', 'profile', ['verify-files']],
+];
+
+// Forbidden provenance strings are built from fragments so this file never contains them.
+const FORBIDDEN = [
+  'cor' + 'tex',
+  'Ji' + 'ra',
+  'AIO' + 'PS',
+  'rai' + '-ops',
+  'Rada' + 'ncy',
+  '{no' + 'format}',
+  'STR' + 'ATA',
+];
+
+// ---- helpers ----
+
+function read(rel) {
+  return fs.readFileSync(path.join(SKILL_DIR, rel), 'utf8').replace(/\r\n/g, '\n');
+}
+
+function walk(dir, out = []) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === 'node_modules') continue;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) walk(full, out);
+    else out.push(full);
+  }
+  return out;
+}
+
+function skillMarkdown() {
+  return walk(SKILL_DIR).filter((f) => f.endsWith('.md'));
+}
+
+/** The lines of `text` that are outside fenced code blocks. */
+function outsideFences(text) {
+  const out = [];
+  let fence = null;
+  for (const line of text.split('\n')) {
+    const m = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+    if (fence === null) {
+      if (m) fence = m[1];
+      else out.push(line);
+    } else if (m && m[1][0] === fence[0] && m[1].length >= fence.length && /^ {0,3}[`~]+\s*$/.test(line)) {
+      fence = null;
+    }
+  }
+  return out;
+}
+
+function headings(text) {
+  return outsideFences(text)
+    .map((l) => /^## (.+?)\s*$/.exec(l))
+    .filter(Boolean)
+    .map((m) => m[1]);
+}
+
+/** The text of one `## ` section, up to the next `## ` heading. */
+function section(text, name) {
+  const lines = text.split('\n');
+  const start = lines.findIndex((l) => l === `## ${name}`);
+  assert.ok(start >= 0, `section ${name} exists`);
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^## /.test(lines[i])) {
+      end = i;
+      break;
+    }
+  }
+  return lines.slice(start + 1, end).join('\n');
+}
+
+async function scriptExports() {
+  const scripts = fs.readdirSync(HERE).filter((f) => f.endsWith('.js') && !f.endsWith('.test.js'));
+  const result = {};
+  for (const file of scripts) {
+    result[file] = await import(pathToFileURL(path.join(HERE, file)).href);
+  }
+  return result;
+}
+
+// ---- FILES table ----
+
+for (const [file, spec] of Object.entries(FILES)) {
+  test(`${file}: exists`, () => {
+    assert.ok(fs.existsSync(path.join(SKILL_DIR, file)), `${file} exists`);
+  });
+
+  test(`${file}: required headings`, () => {
+    const found = headings(read(file));
+    for (const h of spec.headings) {
+      assert.ok(found.includes(h), `${file} has "## ${h}"`);
+    }
+  });
+
+  test(`${file}: required goldens parse`, () => {
+    for (const name of spec.goldens) {
+      assert.ok(goldenNames(path.join(SKILL_DIR, file)).includes(name), `${file} has golden ${name}`);
+      assert.doesNotThrow(() => readGolden(path.join(SKILL_DIR, file), name), `${file} golden ${name} parses`);
+    }
+  });
+
+  test(`${file}: no golden is defined twice`, () => {
+    const names = goldenNames(path.join(SKILL_DIR, file));
+    assert.equal(new Set(names).size, names.length, `${file} golden names are unique: ${names.join(', ')}`);
+  });
+
+  test(`${file}: every relative link resolves`, () => {
+    const text = outsideFences(read(file)).join('\n');
+    const re = /\]\(([^)\s]+)\)/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const target = m[1];
+      if (/^([a-z][a-z0-9+.-]*:|#)/i.test(target)) continue;
+      const rel = decodeURIComponent(target.split('#')[0]);
+      assert.ok(fs.existsSync(path.join(SKILL_DIR, path.dirname(file), rel)), `${file}: link ${target} resolves`);
+    }
+  });
+
+  if (spec.h1 !== undefined) {
+    test(`${file}: starts with ${spec.h1}`, () => {
+      assert.equal(read(file).split('\n')[0], spec.h1);
+    });
+  }
+
+  if (spec.maxLines !== undefined) {
+    test(`${file}: at most ${spec.maxLines} lines`, () => {
+      const text = read(file).replace(/\n$/, '');
+      assert.ok(text.split('\n').length <= spec.maxLines, `${file} has ${text.split('\n').length} lines`);
+    });
+  }
+}
+
+// ---- SKILL.md frontmatter and goldens ----
+
+test('SKILL.md frontmatter: name develop, description starts "Use when"', () => {
+  const m = /^---\n([\s\S]*?)\n---\n/.exec(read('SKILL.md'));
+  assert.ok(m, 'frontmatter block');
+  const front = {};
+  for (const line of m[1].split('\n')) {
+    const kv = /^([a-z]+):\s*(.*)$/.exec(line);
+    if (kv) front[kv[1]] = kv[2];
+  }
+  assert.equal(front.name, 'develop');
+  assert.ok(/^Use when/.test(front.description ?? ''), 'description starts with "Use when"');
+});
+
+test('every routing golden in SKILL.md passes parseArg', () => {
+  const skill = path.join(SKILL_DIR, 'SKILL.md');
+  const names = goldenNames(skill).filter((n) => n === 'routing');
+  assert.equal(names.length, 1, 'one routing golden');
+  const cases = readGolden(skill, 'routing');
+  assert.ok(cases.length > 0);
+  for (const [input, expected] of cases) {
+    assert.deepEqual(parseArg(input, ORIGIN), expected, `routing case ${JSON.stringify(input)}`);
+  }
+});
+
+// ---- the CLI / prose contract ----
+
+test('every CLI script exports SUBCOMMANDS; the libraries do not', async () => {
+  const mods = await scriptExports();
+  for (const lib of LIBRARIES) {
+    assert.ok(lib in mods, `library ${lib} exists`);
+    assert.equal(mods[lib].SUBCOMMANDS, undefined, `${lib} is a library and exports no SUBCOMMANDS`);
+  }
+  const clis = Object.keys(mods).filter((f) => !LIBRARIES.includes(f));
+  assert.ok(clis.length >= 8, `at least eight CLIs, found ${clis.join(', ')}`);
+  for (const file of clis) {
+    const subs = mods[file].SUBCOMMANDS;
+    assert.ok(Array.isArray(subs) && subs.length > 0, `${file} exports a non-empty SUBCOMMANDS array`);
+    for (const s of subs) assert.match(s, /^[a-z][a-z-]*$/, `${file} subcommand ${s}`);
+    assert.equal(new Set(subs).size, subs.length, `${file} SUBCOMMANDS has no duplicates`);
+  }
+});
+
+test('every "<script>.js <word>" in a skill Markdown file names a real subcommand', async () => {
+  const mods = await scriptExports();
+  for (const file of skillMarkdown()) {
+    const text = fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n');
+    for (const m of text.matchAll(CLI_RE)) {
+      const subs = mods[`${m[1]}.js`].SUBCOMMANDS;
+      assert.ok(subs.includes(m[2]), `${path.relative(SKILL_DIR, file)}: "${m[0]}" is not a subcommand of ${m[1]}.js (${subs.join(', ')})`);
+    }
+  }
+});
+
+test('CLI_RE is a whole-token match', () => {
+  const hit = (s) => [...s.matchAll(CLI_RE)].map((m) => m[2]);
+  assert.deepEqual(hit('regions.js body-json x'), ['body-json']);
+  assert.deepEqual(hit('regions.js body-jsonx'), ['body-jsonx']);
+  assert.deepEqual(hit('golden.js and pages.js and pi/develop.js and Node.js is'), []);
+  assert.deepEqual(hit('ghpin.js Run'), ['Run']);
+  assert.deepEqual(hit('counted.js write_access'), ['write_access']);
+});
+
+test('coverage: every subcommand of every CLI is mentioned (active when COMPLETE)', { skip: !COMPLETE }, async () => {
+  const mods = await scriptExports();
+  const seen = new Set();
+  for (const file of skillMarkdown()) {
+    for (const m of fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n').matchAll(CLI_RE)) seen.add(`${m[1]}.js ${m[2]}`);
+  }
+  for (const [file, mod] of Object.entries(mods)) {
+    if (LIBRARIES.includes(file)) continue;
+    for (const s of mod.SUBCOMMANDS) {
+      assert.ok(seen.has(`${file.replace(/\.js$/, '')}.js ${s}`), `${file} ${s} is mentioned in a skill Markdown file`);
+    }
+  }
+});
+
+test('coverage: each home-table subcommand is mentioned in its section (active when COMPLETE)', { skip: !COMPLETE }, () => {
+  for (const [file, name, script, subs] of HOME) {
+    const text = section(read(file), name);
+    const found = new Set([...text.matchAll(CLI_RE)].filter((m) => m[1] === script).map((m) => m[2]));
+    for (const s of subs) assert.ok(found.has(s), `${file} section "${name}" mentions ${script}.js ${s}`);
+  }
+});
+
+// ---- provenance ----
+
+test('no file under skills/develop or in the two reviewer agents has a forbidden provenance string', () => {
+  const files = [
+    ...walk(SKILL_DIR),
+    path.join(AGENTS_DIR, 'adversarial-reviewer.md'),
+    path.join(AGENTS_DIR, 'counterexample-reviewer.md'),
+  ];
+  for (const file of files) {
+    const text = fs.readFileSync(file, 'utf8').toLowerCase();
+    for (const word of FORBIDDEN) {
+      assert.ok(!text.includes(word.toLowerCase()), `${path.relative(REPO, file)} contains a forbidden provenance string`);
+    }
+  }
+});
+
+// ---- content of the sections this task writes ----
+
+test('profile.md: names the path, the default branch and the never-merged PR', () => {
+  const text = read('profile.md').replace(/\s+/g, ' ');
+  for (const term of ['.github/develop.md', 'default branch', 'never merged', 'develop-profile/', 'profile.js parse', 'profile.js verify-files', 'check-ref-format --branch', 'sh -e <file>', 'Node 21', 'gh.account']) {
+    assert.ok(text.includes(term), `profile.md mentions ${term}`);
+  }
+});
+
+test('profile.md: Loading and Initialize carry their rulings', () => {
+  const loading = section(read('profile.md'), 'Loading').replace(/\s+/g, ' ');
+  assert.ok(/warning in Define/.test(loading) && /blocker 6/.test(loading), 'Loading: warning in Define, blocker 6 in Deliver');
+  assert.ok(/ls-tree/.test(loading) && /empty file/.test(loading), 'Loading: the absence test is an empty ls-tree listing');
+  assert.ok(/blocker 3.{0,80}\*\*both\*\* Define and Deliver/.test(loading), 'Loading: a failed read is blocker 3 in both Define and Deliver');
+  assert.ok(/tool trouble/.test(loading) && /blocker 3 in Define and in Deliver/.test(loading), 'Loading: tool trouble is blocker 3 in Define');
+  assert.ok(!/a warning in Define,? and/.test(loading) && !/other git failure/.test(loading), 'Loading: no git failure is a warning');
+  const init = section(read('profile.md'), 'Initialize').replace(/\s+/g, ' ');
+  for (const term of ['docs', 'workflows', 'issue templates', 'reviewer loop', 'never merged']) {
+    assert.ok(init.includes(term), `Initialize mentions ${term}`);
+  }
+});
+
+test('SKILL.md: the Files section links every other file in the skill', () => {
+  const files = outsideFences(section(read('SKILL.md'), 'Files')).join(' ');
+  const linked = new Set([...files.matchAll(/\]\(([^)\s#]+)\)/g)].map((m) => decodeURIComponent(m[1])));
+  const want = walk(SKILL_DIR)
+    .map((f) => path.relative(SKILL_DIR, f).split(path.sep).join('/'))
+    .filter((f) => f !== 'SKILL.md' && !f.endsWith('.test.js') && !f.startsWith('scripts/fixtures/'));
+  for (const f of want) assert.ok(linked.has(f), `SKILL.md Files links ${f}`);
+});
+
+test('SKILL.md: the Preflight section holds the pinned command forms and the CLI rules', () => {
+  const pre = section(read('SKILL.md'), 'Preflight');
+  assert.ok(pre.includes('golden:pinned-commands'), 'Preflight carries the pinned-commands golden');
+  for (const name of ['regions.js', 'checkpoints.js', 'counted.js', 'history.js', 'route.js', 'args.js', 'ghpin.js', 'profile.js']) {
+    assert.ok(pre.includes(name), `Preflight names ${name}`);
+  }
+  assert.ok(pre.includes('golden.js') && pre.includes('pages.js'), 'Preflight names the two libraries');
+  for (const term of ['ask_user', 'update_progress', 'Agent', 'cd <dir> &&']) {
+    assert.ok(pre.includes(term), `Preflight names the pi mapping term ${term}`);
+  }
+  assert.ok(pre.includes('review=self'), 'Preflight covers the review=self fallback');
+});
+
+test('SKILL.md: the overrides table has O1 to O10', () => {
+  const text = section(read('SKILL.md'), 'Overrides of superpowers defaults');
+  for (let i = 1; i <= 10; i++) assert.match(text, new RegExp(`^\\| O${i} \\|`, 'm'), `row O${i}`);
+});
+
+test('SKILL.md: Preflight lists all eight checks in order', () => {
+  const pre = section(read('SKILL.md'), 'Preflight');
+  const nums = [...pre.matchAll(/^(\d)\. \*\*/gm)].map((m) => Number(m[1]));
+  assert.deepEqual(nums, [1, 2, 3, 4, 5, 6, 7, 8]);
+});
+
+test('ticket-standard.md: names the practices, the template path, the marker and the approach limit', () => {
+  const text = read('ticket-standard.md');
+  for (const term of ['INVEST', 'Given/When/Then', '.github/ISSUE_TEMPLATE', '<!-- tr-develop:ac-begin -->', '60 lines']) {
+    assert.ok(text.includes(term), `ticket-standard.md mentions ${term}`);
+  }
+});
+
+test('handoff.md: the sections name the CLIs and the rulings they own', () => {
+  const text = read('handoff.md');
+  const checkpoints = section(text, 'Checkpoints');
+  for (const term of ['checkpoints.js carry', 'checkpoints.js format', 'checkpoints.js readback']) {
+    assert.ok(checkpoints.includes(term), `Checkpoints names ${term}`);
+  }
+  assert.ok(checkpoints.includes('before posting'), 'Checkpoints says the prior progress is taken before posting');
+  const trust = section(text, 'Trust');
+  assert.ok(trust.includes('scratch directory'), 'Trust names the per-run scratch directory');
+  assert.ok(/resumed session is a new run/.test(trust), 'Trust says a resumed session is a new run');
+  assert.ok(/Check integrity \(see Trust: Integrity\), except for a `blocked`, `defined`, `reapproved`, `closed` or `spec-merged`/.test(checkpoints.replace(/\s+/g, ' ')), 'Checkpoints runs integrity at posting, exempting blocked, defined, reapproved, closed and spec-merged');
+  assert.ok(!checkpoints.includes('Integrity is not a posting step'), 'Checkpoints does not drop the per-checkpoint integrity check');
+  assert.ok(/except a `blocked`, `defined`, `reapproved`,\s+`closed` or `spec-merged`/.test(trust), 'Trust names the same five exemptions');
+  assert.ok(section(text, 'Resume and routing').includes('latest'), 'Resume names latest');
+  const reapproval = section(text, 'Re-approval');
+  assert.ok(reapproval.includes('history.js find'), 'Re-approval names history.js find');
+  assert.ok(reapproval.includes('original unavailable'), 'Re-approval covers found:false');
+  assert.ok(/\{ok:false[^}]*\}[^\n]*blocker 3/.test(reapproval), 'Re-approval stops with blocker 3 on {ok:false}');
+});
+
+test('deliver.md: the five flow sections come in the spec order', () => {
+  const found = headings(read('deliver.md'));
+  const order = ['Common steps', 'Plan track', 'Small track', 'Finish and close-out', 'Merged close-out'];
+  const at = order.map((h) => found.indexOf(h));
+  assert.ok(at.every((i) => i >= 0), 'all five sections exist');
+  assert.deepEqual([...at].sort((a, b) => a - b), at, 'the five sections are in order');
+});
+
+test('deliver.md: names the CLIs, the position, the PR keywords and the rulings', () => {
+  const text = read('deliver.md');
+  for (const term of [
+    'route.js', 'position', 'Closes #', 'Refs #', 'final-approved',
+    'checkpoints.js carry', 'checkpoints.js format', 'checkpoints.js readback', 'history.js find',
+    'pinValid', 'Tracks #', 'profile.js verify-files', 'sh -e <file>', 'no AI attribution', 'rev-parse --verify --quiet',
+  ]) {
+    assert.ok(text.includes(term), `deliver.md mentions ${term}`);
+  }
+  assert.ok(/never merge/i.test(text), 'deliver.md says never merge');
+  assert.ok(!text.toLowerCase().includes('co-authored' + '-by'), 'deliver.md has no co-author trailer text');
+});
+
+test('deliver.md: carry runs with the select progress as prior before every kickoff and every reapproved', () => {
+  const text = read('deliver.md').replace(/\s+/g, ' ');
+  assert.ok(/checkpoints\.js carry/.test(text), 'names carry');
+  assert.ok(text.includes('`prior`') && text.includes('before posting'), 'prior is the progress taken before posting');
+  assert.ok(text.includes('every `kickoff` and every `reapproved`'), 'carry before every kickoff and every reapproved');
+});
+
+test('define.md: names the hashes, the comment, the original block, the retry cap and the CLIs it runs', () => {
+  const text = read('define.md');
+  for (const term of [
+    'bodyHash', 'acHash', 'defined', 'Original report', 'at most twice', 'body-json', 'write-access',
+    'checkpoints.js format', 'checkpoints.js readback', 'git check-ref-format --branch', 'Closes #<n>',
+  ]) {
+    assert.ok(text.includes(term), `define.md mentions ${term}`);
+  }
+});
+
+test('review-contract.md: the frame, the cap, the threshold and the required ending', () => {
+  const text = read('review-contract.md');
+  for (const term of ['round N of ≤ 6', '600', 'VERDICT: GO | NO-GO', 'FINDINGS:', 'at most 3 primary agents, each dispatching at most 1 sub-agent', 'review=self']) {
+    assert.ok(text.includes(term), `review-contract.md mentions ${term}`);
+  }
+  const frame = section(text, 'Dispatch frame');
+  const at = ['Scope', 'Constraints', 'Round', 'Fanout', 'Required ending'].map((w) => frame.indexOf(`**${w}`));
+  assert.ok(at.every((i) => i >= 0), 'all five frame parts exist');
+  assert.deepEqual([...at].sort((a, b) => a - b), at, 'the five frame parts are in order');
+  assert.ok(/^1\. \*\*Scope/m.test(frame) && /^5\. \*\*Required ending/m.test(frame), 'the frame parts are numbered 1 to 5');
+});
+
+test('blockers.md: the six blockers are list items, and the procedure names its fields', () => {
+  const text = read('blockers.md');
+  const stop = section(text, 'Stop for these');
+  const nums = [...stop.matchAll(/^(\d)\. /gm)].map((m) => Number(m[1]));
+  assert.deepEqual(nums, [1, 2, 3, 4, 5, 6], 'blockers 1 to 6 are numbered list items in order');
+  const at = section(text, 'At a blocker');
+  for (const term of ['terminal', 'latest', 'stage', 'blocker', 'branch=-', 'head', 'counted.js select', 'BLOCKED:']) {
+    assert.ok(at.includes(term), `At a blocker mentions ${term}`);
+  }
+  assert.ok(text.includes('terminal'), 'blockers.md names the terminal-only kinds');
+});
+
+test('define.md: the open-pull-request lookup reads every page (--paginate --slurp) and states no 100 limit', () => {
+  const text = read('define.md');
+  assert.ok(
+    text.includes('["api","--paginate","--slurp","repos/<owner>/<repo>/pulls?state=open&per_page=100"]'),
+    'Fetch step 3 paginates and slurps the open-PR list',
+  );
+  assert.ok(text.includes('open-prs.json'), 'the list lands in open-prs.json');
+  assert.ok(/every\*\* page/.test(text), 'every page is read');
+  assert.ok(!/first 100|only the first 100/i.test(text), 'no first-100 limitation');
+  assert.ok(read('SKILL.md').includes('--slurp'), 'Preflight states the gh version that supports --slurp');
+});
+
+// ---- the parent track prose ----
+
+test('ticket-standard.md: a parent only through the parent track, never a hand-made epic', () => {
+  const text = read('ticket-standard.md').replace(/\s+/g, ' ');
+  assert.ok(!text.includes('Never create a parent or an epic'), 'the old ban is gone');
+  assert.ok(text.includes('parent track'), 'names the parent track');
+  assert.ok(/never a hand-made epic whose body tracks work/.test(text), 'a hand-made epic is still refused');
+  assert.ok(/plan or parent track/.test(text), 'the spec-bearing sentences name both tracks');
+});
+
+test('define.md: the size decision and the Parent track section', () => {
+  const text = read('define.md');
+  for (const term of ['track=parent', 'Define it as a parent', 'Define only the first piece', 'Parent track', 'route.js parts', 'route.js stub-body', 'parent-read', 'code fence']) {
+    assert.ok(text.includes(term), `define.md mentions ${term}`);
+  }
+  const found = headings(text);
+  assert.ok(found.indexOf('Plan track') < found.indexOf('Parent track') && found.indexOf('Parent track') < found.indexOf('Small track'), 'Parent track sits between Plan track and Small track');
+  assert.ok(section(text, 'Plan track').includes('regions.js neutralize'), 'Draft the ticket stays inside the Plan track section');
+  const parent = section(text, 'Parent track').replace(/\s+/g, ' ');
+  assert.ok(/marker-in-text/.test(parent) && /never presented/.test(parent), 'a parts or stub-body failure is a finding that is never presented');
+  assert.ok(/no sub-issue/i.test(parent), 'Publish creates no sub-issues');
+});
+
+test('blockers.md: blocker 2 covers a merged parent spec that cannot be read', () => {
+  const stop = section(read('blockers.md'), 'Stop for these').replace(/\s+/g, ' ');
+  assert.ok(/2\. \*\*The approved artifact would have to change:\*\*[^\n]*parent spec/.test(stop), 'blocker 2 names a merged parent spec');
+});
+
+test('deliver.md: the parent flow sections, in order', () => {
+  const found = headings(read('deliver.md'));
+  const at = (h) => found.indexOf(h);
+  assert.ok(at('Small track') < at('Parent track') && at('Parent track') < at('Finish and close-out'), 'Parent track sits between Small track and Finish and close-out');
+  assert.ok(at('Merged close-out') < at('Ensure-stubs'), 'Ensure-stubs follows Merged close-out');
+  assert.ok(at('After the PR') < at('Status mode'), 'Status mode follows After the PR');
+});
+
+test('deliver.md: names the parent-track scripts, route names, the PR keyword and the status rules', () => {
+  const text = read('deliver.md');
+  for (const term of [
+    'spec-merged', 'Refs #', 'terminal-pin', 'parent-status', 'settled', 'state=open', 'sub_issues',
+    'route.js parts', 'route.js stub-body', 'route.js stub', 'specBlob', 'refs/pull/<pr>/head', 'per_page=100&page=',
+    'sub_issue_id', 'counted.js write-access', 'issue-close', 'askClosed',
+  ]) {
+    assert.ok(text.includes(term), `deliver.md mentions ${term}`);
+  }
+  const common = section(text, 'Common steps').replace(/\s+/g, ' ');
+  assert.ok(/`terminal-pin`/.test(common) && /`parent-status`/.test(common) && /before any pin validation/.test(common), 'Common steps routes the two parent routes before pin validation');
+  assert.ok(/`blocked`, `defined`, `reapproved`, `closed` and `spec-merged`/.test(read('deliver.md').replace(/\s+/g, ' ')), 'deliver.md lists spec-merged among the integrity exemptions');
+  const ensure = section(text, 'Ensure-stubs').replace(/\s+/g, ' ');
+  assert.ok(/\^\\d\{4\}/.test(ensure) && /definedAt/.test(ensure), 'Ensure-stubs tests definedAt against the strict pattern first');
+  assert.ok(/lowest/.test(ensure) && /adopt/.test(ensure) && /no assignee/.test(ensure), 'Ensure-stubs: lowest number, adoption, no assignee');
+  assert.ok(/code fence|fenced/.test(section(read('define.md'), 'Parent track')), 'define.md warns against fences in part text');
+});
+
+test('handoff.md: spec-merged in the position table, the progress enumeration, the concurrency lists and the route rules', () => {
+  const text = read('handoff.md');
+  const resume = section(text, 'Resume and routing');
+  const position = resume.slice(resume.indexOf('**Position.**'), resume.indexOf('**Route.**'));
+  assert.ok(/\|\s*`spec-merged`\s*\|\s*`parent-status`\s*\|/.test(position), 'the position table maps spec-merged to parent-status');
+  assert.ok(/parent track, `kickoff` or `reapproved`\s*\|\s*`finish`/.test(position), 'the position table maps a parent kickoff or reapproved to finish');
+  const trust = section(text, 'Trust').replace(/\s+/g, ' ');
+  assert.ok(/`progress` is the latest counted `kickoff`, `plan-approved`, `tasks`, `final-approved`, `pr-open`, `spec-merged`, `closed` or `reapproved`/.test(trust), 'the progress enumeration names spec-merged');
+  const flat = resume.replace(/\s+/g, ' ');
+  assert.ok(/not `defined`, `pr-open`, `spec-merged`, `blocked` or `closed`/.test(flat), 'the concurrency heartbeat list names spec-merged');
+  assert.ok(/no later counted checkpoint is `pr-open`, `spec-merged`, `blocked` or `closed`/.test(flat), 'the ends-a-run list names spec-merged');
+  assert.ok(/`pr-open`, `spec-merged` or `closed`, which route before any pin validation/.test(flat), 'the pinValid sentence names spec-merged');
+  const route = flat.slice(flat.indexOf('**Route.**'));
+  assert.ok(route.indexOf('`parent-status`') > 0 && route.indexOf('`terminal-pin`') > 0, 'the route rules name both routes');
+  assert.ok(route.indexOf('`parent-status`') < route.indexOf('`repin-or-stop`'), 'the parent routes come before the pin check');
+  assert.ok(/closes issue `<n>` as completed \(the parent, or a part's issue in Status mode, on a yes\)/.test(trust), 'the issue-close sentence covers a part');
+  const after = section(text, 'After the PR').replace(/\s+/g, ' ');
+  assert.ok(/`spec-merged`/.test(after) && /Ensure-stubs/.test(after), 'the After-the-PR Merged bullet names the parent track path');
+  const re = section(text, 'Re-approval').replace(/\s+/g, ' ');
+  assert.ok(/a parent has no `planSha`/i.test(re) && /`finish`/.test(re), 'Re-approval says a parent has no planSha and positions at finish');
+});
+
+// ---- the sub-ticket prose ----
+
+test('define.md: a sub-ticket is found, trusted, checked for dependencies and given context in Fetch', () => {
+  const text = read('define.md');
+  for (const term of [
+    'GET repos/<owner>/<repo>/issues/<n>/parent', 'parentBlob', 'route.js parent-line', 'Deviation from the parent design',
+    'Part <k> of <count> in #<parent>', 'define anyway',
+  ]) {
+    assert.ok(text.includes(term), `define.md mentions ${term}`);
+  }
+  const fetch = section(text, 'Fetch').replace(/\s+/g, ' ');
+  assert.ok(/route\.js stub/.test(fetch) && /standalone/.test(fetch), 'Fetch asks standalone-or-stop on a stub line without a link');
+  assert.ok(/not merged yet/.test(fetch) && /`spec-merged`/.test(fetch), 'Fetch stops on a parent spec that is not merged yet');
+  assert.ok(/route\.js parts/.test(fetch) && /counted/.test(fetch), 'Fetch checks the part in the parent spec and counts the parent checkpoints');
+  assert.ok(/at most 5/.test(fetch) && /2,000/.test(fetch), 'Fetch limits the sibling summaries');
+  assert.ok(/deliver\.md#ensure-stubs/.test(fetch), 'Fetch uses the Ensure-stubs selection for the dependency state');
+});
+
+test('define.md: the Sub-ticket section holds the parent line, the review, the stub line and the pin fields', () => {
+  const text = read('define.md');
+  const found = headings(text);
+  assert.ok(found.indexOf('Small track') < found.indexOf('Sub-ticket') && found.indexOf('Sub-ticket') < found.indexOf('Sign-off'), 'Sub-ticket sits between Small track and Sign-off');
+  const sub = section(text, 'Sub-ticket').replace(/\s+/g, ' ');
+  assert.ok(/Parent: #<parent>, Part <k> \(<parent spec path>\)/.test(sub) && /route\.js parent-line/.test(sub), 'the Parent line and its check');
+  assert.ok(/60-line limit/.test(sub), 'the small track counts the Parent line toward 60 lines');
+  assert.ok(/git rev-parse origin\/<base>:<parent spec>/.test(sub) && /`parent`/.test(sub), 'the blob is computed at origin/<base>');
+  assert.ok(/stub's first line/.test(sub), 'the rewritten body keeps the stub line');
+  assert.ok(/Sign-off/.test(sub) || /sign-off preview/.test(sub), 'the sign-off preview shows both fields');
+  assert.ok(/`parent` and `parentBlob`/.test(section(text, 'Publish').replace(/\s+/g, ' ')), 'Publish puts both fields in the pin');
+});
+
+test('deliver.md: the parent-drift warning, Part of in the PR body and the re-approval recompute', () => {
+  const text = read('deliver.md');
+  assert.ok(text.includes('Part of #') && text.includes('parent spec changed'), 'deliver.md names Part of # and the drift warning');
+  const common = section(text, 'Common steps').replace(/\s+/g, ' ');
+  assert.ok(/route\.js parent-line/.test(common) && /`parentBlob`/.test(common) && /never a stop/.test(common), 'integrity reads the Parent line, compares the blob and never stops');
+  assert.ok(/git show origin\/<branch>:<spec>/.test(common) && /before the workspace of step 5 exists/.test(common), 'parent drift reads the spec from origin, not from a worktree that does not exist yet');
+  const finish = section(text, 'Finish and close-out').replace(/\s+/g, ' ');
+  assert.ok(/`Closes #<n>`[^.]*`Part of #<parent>`/.test(finish), 'the PR body adds Part of after Closes');
+  const re = section(text, 'Re-approval').replace(/\s+/g, ' ');
+  assert.ok(/`parentBlob`/.test(re) && /`checkpoints.js carry` does not carry/.test(re) && /old and (the )?new blob/.test(re), 'Re-approval recomputes parent and parentBlob and shows both blobs');
+});
+
+test('handoff.md: Re-approval recomputes parent and parentBlob and checks a changed parent spec first', () => {
+  const re = section(read('handoff.md'), 'Re-approval').replace(/\s+/g, ' ');
+  assert.ok(/`parent` and `parentBlob`/.test(re) && /old and (the )?new blob/.test(re), 'step 1 shows the old and new blob');
+  assert.ok(/does not carry `parent` and `parentBlob`/.test(re), 'checkCarry does not carry the two fields');
+  assert.ok(/keeps the old fields and warns/.test(re), 'a failed recompute keeps the old fields');
+  assert.ok(/route\.js parts/.test(re) && /stub-body/.test(re), 'a changed parent spec is checked with parts and the stub-body dry run before approval');
+});
+
+test('deliver.md and handoff.md: the Task 6 carry-overs', () => {
+  const deliver = read('deliver.md');
+  const ensure = section(deliver, 'Ensure-stubs').replace(/\s+/g, ' ');
+  assert.ok(/`parent-read`/.test(ensure) && /parent_issue_url/.test(ensure) && /absent/.test(ensure), 'm1: parent-read when parent_issue_url is absent');
+  const merged = section(deliver, 'Merged close-out').replace(/\s+/g, ' ');
+  assert.ok(/`track=parent`[^.]*follows \[Parent track close-out\]/.test(merged), 'm3: a parent follows its own close-out');
+  assert.ok(/`spec` and `approvedSha` (come|are taken) from the pin, or from the `pr-open` checkpoint when the pin is absent/.test(merged), 'm3: spec and approvedSha from the pin or the pr-open');
+  assert.ok(/fewer than 100 entries, at most 5/.test(ensure) && /cut short/.test(ensure), 'm4: the scan pages and the cut-short rule');
+  assert.ok(/`sub-issue-link`[^.]*numeric `id`/.test(ensure), 'm4: adoption links the numeric id');
+  const status = section(deliver, 'Status mode').replace(/\s+/g, ' ');
+  assert.ok(/`gh` is `<login>`/.test(status) && /`branch`, `head` and `pr` from `spec-merged`/.test(status), 'm5: the closed checkpoint fields');
+  assert.ok(/every stop path/i.test(status) && /scratch directory/.test(status), 'm6: Status mode cleans up on every stop path');
+  const handoff = read('handoff.md').replace(/\s+/g, ' ');
+  assert.ok(/for a parent, by Ensure-stubs creating and linking stubs and by `issue-close` after a yes in Status mode/.test(handoff), 'm2: the issue-own-state paragraph');
+  assert.ok(/acceptance-criteria region \(every track\)/.test(handoff), 'm7: every track');
+});
+
+// ---- the entry point and the user-facing documents for parents ----
+
+function readRepo(rel) {
+  return fs.readFileSync(path.join(REPO, rel), 'utf8').replace(/\r\n/g, '\n');
+}
+
+test('SKILL.md: Issue entry names the two parent routes and Memory follows spec-merged', () => {
+  const entry = section(read('SKILL.md'), 'Issue entry').replace(/\s+/g, ' ');
+  assert.ok(/- `parent-status`: .{0,80}`spec-merged`.{0,200}Status mode/.test(entry), 'parent-status: latest progress spec-merged, go to Status mode');
+  assert.ok(/before any pin validation/.test(entry.slice(entry.indexOf('`parent-status`'))), 'parent-status is chosen before pin validation');
+  assert.ok(/- `terminal-pin`:/.test(entry) && /un-minimize/.test(entry) && /no re-pin/i.test(entry), 'terminal-pin: restore or un-minimize the pin, no re-pin');
+  assert.ok(entry.indexOf('`after-the-pr`') < entry.indexOf('`parent-status`') && entry.indexOf('`parent-status`') < entry.indexOf('`terminal-pin`') && entry.indexOf('`terminal-pin`') < entry.indexOf('`new-issue-or-stop`'), 'the new routes sit after after-the-pr and before new-issue-or-stop');
+  const memory = section(read('SKILL.md'), 'Memory').replace(/\s+/g, ' ');
+  assert.ok(/`spec-merged`/.test(memory), 'Memory snapshots at spec-merged');
+  assert.ok(/`Refs #<n>`[^.]*parent/.test(section(read('SKILL.md'), 'Commits and PRs').replace(/\s+/g, ' ')), 'Commits and PRs says a parent says Refs');
+  assert.ok(/`Part of #<parent>`/.test(section(read('SKILL.md'), 'Commits and PRs').replace(/\s+/g, ' ')), 'Commits and PRs says a sub-ticket PR adds Part of');
+});
+
+test('define.md: the closing sentence of Fetch step 5 says an unmerged parent spec stops', () => {
+  const fetch = section(read('define.md'), 'Fetch').replace(/\s+/g, ' ');
+  assert.ok(/out\) is said, then ask standalone-or-stop \(an unmerged parent spec stops, as above\)\./.test(fetch), 'the closing sentence carries the exception');
+});
+
+test('tutorial.md: one paragraph on a parent, its spec PR and its sub-tickets', () => {
+  const text = read('tutorial.md').replace(/\s+/g, ' ');
+  assert.ok(/parent/.test(text) && /sub-ticket/.test(text) && /spec/.test(text), 'tutorial.md mentions a parent, its spec and sub-tickets');
+});
+
+test('docs/develop.md: the parent section, its compatibility note and what the probe verified', () => {
+  const doc = readRepo('docs/develop.md');
+  assert.ok(headings(doc).includes('Larger work: parent tickets and sub-tickets'), 'the section exists');
+  const sec = section(doc, 'Larger work: parent tickets and sub-tickets').replace(/\s+/g, ' ');
+  assert.ok(/Parent tickets need this version of the skill\./.test(sec), 'parents need this version of the skill');
+  assert.ok(/minimize/i.test(sec) && /`closed`/.test(sec) && /`spec-merged`/.test(sec), 'the recovery for a wrong closed comment');
+  assert.ok(/-F sub_issue_id/.test(sec) && /state_reason/.test(sec) && /not verified|unverified/i.test(sec), 'the verified calls and the unverified one');
+  assert.ok(/Refs #/.test(sec) && /never `Closes`|closes nothing/i.test(sec), 'the spec PR closes nothing');
+});
+
+test('AGENTS.md and CHANGELOG.md: the parent track is described where contributors look', () => {
+  const agents = section(readRepo('AGENTS.md'), 'develop skill').replace(/\s+/g, ' ');
+  for (const term of ['track=parent', 'spec-merged', 'parent-status', 'terminal-pin', 'route.js parts', 'parentBlob', 'Ensure-stubs']) {
+    assert.ok(agents.includes(term), `AGENTS.md develop skill section mentions ${term}`);
+  }
+  const log = readRepo('CHANGELOG.md');
+  // The entry sits in whichever changelog section shipped it, so find it by its ticket number: a release renames
+  // "Unreleased" to a version heading and must not break this test.
+  const entry = log.split('\n').find((line) => line.startsWith('- ') && /parent ticket/i.test(line) && /\(#103\)/.test(line));
+  assert.ok(entry !== undefined, 'the changelog has the parent entry (#103)');
+  const text = entry.replace(/\s+/g, ' ');
+  assert.ok(/sub-ticket/.test(text) && /need this version/.test(text), 'the parent entry has the compatibility note');
+});

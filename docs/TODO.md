@@ -1,0 +1,408 @@
+# Deferred Items
+
+Features planned in the design spec but not yet implemented.
+
+## Completed
+
+### ~~Benchmark Corpus Expansion~~
+
+Expanded corpus from 20 to 100 entries across 6 categories. Queries expanded from 20 to 139 including synonym, partial match, and negative assertion queries. Added `expected_absent` support to benchmark runner.
+
+### ~~Evolving Benchmarks (--grow)~~
+
+Retrieval misses from `eval_report` auto-captured as candidates in `benchmark_candidates` table. `eval_grow` tool supports list mode (pending candidates sorted by frequency) and resolve mode (accept/reject, with accepted entries appended to `retrieval.jsonl`).
+
+### ~~A/B Config Comparison~~
+
+Config snapshots auto-created on `session_start` and before `config_set`. `eval_compare` tool provides side-by-side metrics with per-tier/per-content-type breakdowns and query-level diff. `eval_snapshot` tool for manual snapshots.
+
+### ~~Regression Detection~~
+
+Compares retrieval metrics between config snapshots at session_start. Alerts when miss rate increases by ≥ `regression.miss_rate_delta` or latency increases by ≥ `regression.latency_ratio`. Configurable thresholds with sensible defaults. Skipped when insufficient data.
+
+### ~~Additional Host Importers~~
+
+Added Cursor, Cline, OpenCode, and Hermes importers. Extracted shared utilities to `import-utils.ts`. Cursor imports project rules (`.cursorrules`, `.cursor/rules/*.mdc`) and global rules from SQLite. Cline imports global rules and task summaries. OpenCode imports `AGENTS.md` files and custom agents/commands. Hermes imports `§`-delimited memory entries, skills, and SOUL.md.
+
+### ~~First-Run Smoke Test~~
+
+> **.NET.** Implemented in `SmokeTestGate` (issue #51): synchronous at the end of `session_start`, cancelled between steps after 20 s, fixed 0.8 exact-match threshold, isolated ephemeral database, version recorded only after a completed run. See `AGENTS.md`, "What happens on `session_start`", step 5.
+
+Version-gated smoke test runs on first install and after upgrades. 22-query corpus in `eval/benchmarks/smoke.jsonl` exercises semantic similarity, tier routing, and negative assertions. Results surfaced in `session_start` response as `smokeTest` field. Version tracked in `_meta` table.
+
+### ~~Post-Ingest Validation Queries~~
+
+Replaced single-chunk identity check with 3-probe validation. Probes sample chunks at 0%, 33%, and 66% through the document via scoped vector search. `IngestFileResult` now includes per-probe details. `IngestDirectoryResult` tracks per-file validation failures.
+
+### ~~Config Snapshot Auto-Creation~~
+
+> **.NET.** `session_start` pins a snapshot of the running config (`SessionConfigSnapshot`) and retrieval and compaction events carry its id. The CLI `config set` and `eval_snapshot` also create snapshots; the MCP `config_set` does not. Postgres mode keeps the placeholder id.
+
+Snapshots auto-created on `session_start` and before `config_set`. Deduplication via SHA-256 hash of recursively key-sorted config JSON. Snapshot IDs threaded through retrieval events and compaction logging.
+
+### ~~Benchmark Use Cases~~
+
+CI smoke test added — runs 22-query smoke benchmark with real ONNX embedder after build, fails the pipeline if exact match rate drops below 80%. Entry point: `src/eval/ci-smoke.ts`, built as second tsup entry to `dist/eval/ci-smoke.js`, invoked via `npm run benchmark`. First-install validation covered by existing `runSmokeTest()` at session_start. Config tuning covered by `eval_compare` tool.
+
+### ~~Cortex Connection~~
+
+Hybrid local+remote mode connecting the plugin to Total Recall Cortex. Local SQLite for user memories with bidirectional sync to Cortex API, remote queries for global KB. Async ingest on Cortex side via staging table + Hangfire. Content-only sync (no vectors) — each side re-embeds independently (ONNX 384-dim vs. Cohere v4 1024-dim). Implemented across 0.9.1-0.9.4.
+
+## Backlog
+
+Items below are not urgent. Revisit when real-world usage surfaces a need.
+
+### True MRR Computation
+
+Replace simplified MRR (binary 1.0 if top result used, 0 otherwise) with rank-aware reciprocal rank. Current approach in `Metrics.cs` / `ComparisonMetrics.cs` doesn't consider which result in the set was actually used.
+
+**Files:** `src/TotalRecall.Infrastructure/Eval/Metrics.cs`, `src/TotalRecall.Infrastructure/Telemetry/RetrievalEventLog.cs`
+**Blocked by:** Per-result outcome tracking — needs `outcome_rank` column in `retrieval_events` schema and an updated `UpdateOutcome()` signature to accept rank. Also depends on reliable rank reporting from host LLMs.
+
+### Compaction Health Fields
+
+Populate `semantic_drift`, `facts_preserved`, `facts_in_original`, `preservation_ratio` in `compaction_log`. Schema columns exist but are always NULL.
+
+**Files:** `src/TotalRecall.Core/Compaction.fs` (decision logic), `src/TotalRecall.Infrastructure/Search/VectorSearch.cs` (drift measurement), `src/TotalRecall.Infrastructure/Telemetry/CompactionLog.cs` (persistence)
+**Blocked by:** Content merging during compaction — fields are trivially 1.0 until entries are actually merged/summarized. Note that compaction is now host-orchestrated via the `session_end` flow (host subagent calls `memory_store` / `memory_delete` / `memory_promote` / `memory_demote`), so the "merging" that would populate these fields happens in the host's LLM judgment step, not in the .NET server.
+
+### Automatic Outcome Detection
+
+Auto-detect user corrections, preferences, and acknowledgments in conversation flow to populate `outcome_signal` on retrieval events. Currently requires manual outcome updates from the host tool.
+
+**Files:** `src/TotalRecall.Infrastructure/Telemetry/RetrievalEventLog.cs`, skill instructions in `skills/commands/SKILL.md`
+**Complexity:** High — requires conversation pattern analysis or LLM classification of user responses relative to retrieved context. Per the self-contained-binary principle, LLM judgment for this would live in the host tool's plugin layer, not in the .NET server.
+
+### PreToolUse Hook (Optional Fallback)
+
+Belt-and-suspenders backup for session initialization. A PreToolUse hook that fires once per session (using a `/tmp` marker keyed on `session_id`) to inject a reminder to call `session_start` if the model hasn't already.
+
+**Files:** `hooks/hooks.json`, new `hooks/pre-tool-use/run.sh`
+**Depends on:** Evidence that the current three-layer approach (server-side init, hook directive, `/using-total-recall` skill) is still unreliable. No failure reports from the cutover betas suggest it's needed right now.
+
+### PDF Parsing
+
+Not supported in the chunker. Would need a PDF-to-text library callable from F#/C# — e.g., `PdfPig` (AOT-compatible? needs verification) or shell out to `pdftotext` at build/runtime.
+
+**Files:** `src/TotalRecall.Core/Chunker.fs`, `src/TotalRecall.Core/Parsers.fs`, possibly a new `src/TotalRecall.Infrastructure/Ingestion/PdfExtractor.cs` since PDF parsing needs I/O (not pure).
+
+### Code Parser AST Analysis
+
+Current code parser in `Parsers.fs` uses regex splitting for function/class boundaries. Full AST parsing (via Roslyn for C#, FSharp.Compiler.Service for F#, tree-sitter for other languages) would produce more accurate chunks at language-aware boundaries.
+
+**Files:** `src/TotalRecall.Core/Parsers.fs`
+**Complexity:** Per-language. Roslyn is the cleanest option for C# and the .NET team maintains an AOT-compatible subset. Tree-sitter bindings for .NET exist (`TreeSitter.Net`) but their AOT story is unverified. Regex is the pragmatic baseline.
+
+### `kb_search` Collection Filter in Cortex Mode
+
+The `collection` parameter passed to `kb_search` is silently ignored when running in cortex mode. `KbSearchHandler` short-circuits to `SearchRemoteAsync` at line 129 before the collection post-filter runs, and `KnowledgeChunk` in cortex has no `CollectionId`/`ParentId` fields anyway.
+
+Fix requires changes in both repos:
+
+**total-recall-cortex:**
+1. Add `CollectionId`/`ParentId` columns to `KnowledgeChunk` entity + migration
+2. Populate during KB ingestion
+3. `PluginSyncController.SearchKnowledge` — add `[FromQuery] string? collection`, filter `dbQuery` by it, include `collection_id` in the projection
+
+**total-recall (plugin):**
+4. `IRemoteBackend.SearchKnowledgeAsync` + `CortexClient` — add `string? collection` param, append to URL
+5. `KbSearchHandler.SearchRemoteAsync` — accept and pass `collection`; remove the early return at line 129 that bypasses it
+
+Before committing to the schema migration, verify whether `KnowledgeChunk.Label` already encodes collection identity — if so, filtering by `Label` may be sufficient with only changes 4–5 plus a `WHERE` clause in the controller.
+
+**Files:** `src/TotalRecall.Server/Handlers/KbSearchHandler.cs`, `src/TotalRecall.Infrastructure/Sync/IRemoteBackend.cs`, `src/TotalRecall.Infrastructure/Sync/CortexClient.cs` (plugin); `TotalRecall.Cortex.Core/Entities/KnowledgeChunk.cs`, `TotalRecall.Cortex.Api/Controllers/PluginSyncController.cs` (cortex)
+
+### Cortex Sticky-Pin Support
+
+The Cortex server must add sticky-pin support; until then sticky pins are local-only (not synced, not migrated). (As of 4.0 the Pinned tier is merged into Hot as a `sticky` flag, so the sync gates key on the flag rather than a distinct tier.) The plugin gates are deliberate: `RoutingStore` never enqueues sticky upserts/deletes to `sync_queue`, `SyncService` pull/reconcile excludes sticky entries (remote updates/tombstones can never mutate a local pin), and `migrate_to_remote` silently skips sticky entries. Accepted edge until then: pinning an entry that already exists remotely leaves the remote copy untouched, and a later re-pull can reintroduce it as a separate non-sticky entry. When Cortex supports sticky pins: lift the RoutingStore/SyncService/MigrateToRemote sticky gates.
+
+**Files:** `src/TotalRecall.Infrastructure/Sync/RoutingStore.cs`, `src/TotalRecall.Infrastructure/Sync/SyncService.cs`, `src/TotalRecall.Server/Handlers/MigrateToRemoteHandler.cs` (plugin); the Cortex server (sticky-pin support)
+
+### Reranker (Cortex-Side)
+
+Cross-encoder or Cohere Rerank API pass after pgvector retrieval on the Cortex side, improving KB search quality for plugin queries. Plugin-side reranking (bundled ONNX cross-encoder) is a separate future consideration. Address when retrieval eval metrics show top-K precision is a bottleneck.
+
+## Gaps found in the TODO audit
+
+Found while auditing the `TODO` comments in `src/` (the old `TODO(Plan N)` labels were dropped). Each of these is real; the comments in code now say so.
+
+### ~~Port the TypeScript `session_start` extras to .NET~~
+
+Done. The per-session config snapshot is implemented (events carry its id, so snapshot-based `eval_compare` filtering separates periods), regression detection populates `regressionAlerts` from the `regression.*` settings, and the first-run smoke test populates `smokeTest` (issue #51).
+
+### Pass the detected project to the host importers
+
+`session_start` now reports `project`, `warmSweep` and `projectDocs` (issue #47), but the host importers are still always called with `project: null` (`SessionLifecycle.cs`, importer loop), so imported memories are stored as global. The detected project is available there (`detectedProject`).
+
+### `status` returns stub telemetry
+
+`StatusHandler` reports `activity` as zeros and `lastCompaction` as `null`, although `RetrievalEventLog` and `CompactionLog` persist the data and `eval_report` reads it.
+
+### `ModelNotReadyException` has no producer
+
+`ErrorTranslator` handles it, but `OnnxEmbedder` / `ModelManager` never throw it, so hosts never get the structured `model_not_ready` payload that the `using-total-recall` skill describes.
+
+### Smaller open items
+
+- `kb_search`: hierarchical collection matching and `needsSummary` tracking (`KbSearchHandler.cs`); `kb_ingest_dir` ignores its `collection` argument.
+- Atomicity gaps: a crash between the move and the re-embed (`MoveHelpers.cs`) or between insert and embed (`ImportCommand.cs`, `MemoryImportHandler.cs`) leaves a row without an embedding.
+- `McpServer` does not thread a `CancellationToken` through the dispatch loop or into handlers, so `notifications/cancelled` and Ctrl+C cannot interrupt a blocked read or an in-flight call.
+- CLI `memory inspect` prints no compaction history; the `memory_inspect` MCP tool does.
+
+## Follow-ups deferred from the retrieval-quality feedback loop
+
+Items identified while building the `memory_feedback` / read-time-inference loop and the web UI loading vocabulary. Not urgent.
+
+### Session-scoped retrieval-feedback correlation
+
+`memory_feedback` matches a retrieval purely by `retrievalId`. If a host reuses or loses the id across a session boundary, feedback can't be attributed. A follow-up would let `memory_feedback` also accept/verify a `session` and fall back to the most-recent un-acted retrieval for that session when no id is supplied.
+
+**Files:** `src/TotalRecall.Server/Handlers/MemoryFeedbackHandler.cs`, `src/TotalRecall.Infrastructure/Telemetry/RetrievalEventLog.cs`
+
+### Cortex-side retrieval-outcome aggregation
+
+Retrieval outcomes are recorded in the local `retrieval_events` table only. In cortex mode there is no roll-up of feedback across team members, so retrieval-quality metrics stay per-user/local. A follow-up would sync (anonymized) outcome signals to Cortex and aggregate them server-side.
+
+**Files:** `src/TotalRecall.Infrastructure/Sync/` (new outcome sync), the Cortex server (aggregation endpoint)
+
+### Configurable grace window for miss inference
+
+The read-time miss-inference grace window is exposed on `eval_report` (`grace_minutes`, default 60) and the CLI (`--grace-minutes`), but the Insights health score hardcodes 60 minutes (`InsightsHandler.GraceWindowMs`). A config knob (e.g. `regression.grace_minutes` in `config.toml`) would let operators tune it once and have every consumer honor it.
+
+**Files:** `src/TotalRecall.Core/Config.fs`, `src/TotalRecall.Server/Handlers/InsightsHandler.cs`, `src/TotalRecall.Server/Handlers/EvalReportHandler.cs`
+
+### ConfirmDialog double-submit guard
+
+The shared `ConfirmDialog` confirm button has no `disabled={busy}` guard, so double-clicking Confirm while an action is in flight can re-enter the handler (`MemoryDetail.tsx` / `KbCollectionsTable.tsx` only guard against null-pending, not busy-pending). Pre-existing; surfaced by the new busy/elapsed progress work. One-line fix: thread a `busy` prop into `ConfirmDialog` and disable the confirm button.
+
+**Files:** `src/TotalRecall.Web/ClientApp/src/components/ConfirmDialog.tsx`, `src/TotalRecall.Web/ClientApp/src/components/memory/MemoryDetail.tsx`, `src/TotalRecall.Web/ClientApp/src/components/kb/KbCollectionsTable.tsx`
+
+## Post-cutover follow-ups (0.8.x .NET)
+
+Items identified during the 0.7.2 TS → 0.8.0 .NET cutover but deferred out of the beta window. Revisit once `main` is on `0.8.x` and the beta has baked cleanly.
+
+### ~~Checksum Verification of Downloaded Binaries~~
+
+Implemented in the MCP bootstrap shim: the shim provisioner downloads the engine archive and verifies it by sha256 against `provisioning.manifest.json` (generated and attached to each GitHub Release by `release.yml`) before extracting. A `.verified.json` marker next to the binary keeps steady-state startup instant (no re-hash on every launch). Reject-on-mismatch with clear error included.
+
+### ~~Signed Releases~~
+
+Implemented in `release.yml` (issue #64). The publish job attests the four platform archives and `provisioning.manifest.json` with `actions/attest@v4` (GitHub artifact attestations, signed through sigstore), before they are attached to the GitHub Release; a failed attestation stops the release assets from being published. Users verify with `gh attestation verify <file> --repo strvmarv/total-recall` (`docs/verifying-a-release.md`). `scripts/release-workflow.test.js` pins the step, its position and the permission. Not done: the shim does not enforce attestations (that would need a sigstore verifier, and the shim stays zero-dependency), and there are no cosign signatures or SBOMs. Windows Authenticode signing is a separate entry below.
+
+### ~~Binary Cache Survives Plugin Reinstall~~
+
+Implemented in `scripts/fetch-binary.js` and `bin/shim/provisioner.js` (issue #65). A verified engine archive is kept in `<dataDir>/cache/binaries/<version>/` (with a sha256 sidecar) and restored before the shim fetches the release manifest, so a same-version reinstall or a second host needs no download and works offline. It caches the archive, not the extracted tree, and the plugin-tree layout and every `getBinaryPath()` consumer are unchanged. See `AGENTS.md`, "`.mcp.json` invocation", for the rules (what may be cached, when an entry is deleted, the owner-only and ownership checks). Not done: running the engine straight from the cache, restoring on the install-time (`postinstall`) path, and a command to clear the cache.
+
+### Intel Mac (osx-x64) Support
+
+Dropped in `v0.8.0-beta.2` to get the release matrix green (the `macos-13` runner was deprecated and the legacy `darwin-x64` RID was invalid). Add back via either a `macos-13-large` / `macos-15-large` Intel runner or cross-compile from `macos-14` arm64. Only do this if demand surfaces — all Apple hardware since Nov 2020 is arm64.
+
+**Files:** `.github/workflows/release.yml`, `scripts/fetch-binary.js`, `bin/start.js`
+
+### ~~npm publish --provenance~~
+
+Implemented in `release.yml`: the `publish` job has `id-token: write` and runs `npm publish --provenance` (with and without `--tag`, for prereleases and stable releases) under npm trusted publishing. Confirmed in issue #64.
+
+### release.yml Dry-Run Step
+
+Add `npm publish --dry-run` before the real publish so tarball shape regressions (missing `files` entries, unexpected sizes) are caught before the publish commits. The dry-run step can also surface the tarball content list for human review in the workflow log.
+
+**Files:** `.github/workflows/release.yml`
+
+### Multi-platform dotnet-ci.yml
+
+`dotnet-ci.yml` currently only runs on `ubuntu-latest`, so Windows and macOS regressions are only caught at real `v*` tag pushes by `release.yml`. Add a matrix (ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest) so PR review catches platform-specific breakage without burning a release tag.
+
+**Files:** `.github/workflows/dotnet-ci.yml`
+
+### ~~Node.js 24 Migration in Workflows~~
+
+Done. Every action used in `release.yml` and `dotnet-ci.yml` has the Node 24 action runtime (`runs.using: node24` in its `action.yml`, checked in issue #64): `actions/checkout@v5`, `actions/setup-node@v5`, `actions/setup-dotnet@v5`, `actions/upload-artifact@v6`, `actions/download-artifact@v7`, `actions/attest@v4` and `softprops/action-gh-release@v3`. The `node-version: 20` and `22` settings in the workflows are the Node versions the project's own scripts run on, not the action runtime.
+
+### ~~Plugin Version Single Source of Truth~~
+
+Implemented in `scripts/sync-version.js` (issue #62). One list of the seven version files (eight fields: `package.json`, both `package-lock.json` fields, the four plugin manifests, `hermes-plugin/plugin.yaml`) lives in the script. `node scripts/sync-version.js <version>` sets all of them at once, staging every change before replacing any file and editing the two lockfile fields by position (no `npm install`, so the multi-platform lockfile cannot be broken). `--check` verifies them against `package.json` and fails on any tracked `plugin.json`/`plugin.yaml` that is not in the list. `codex/manifest.test.js` runs `--check` in CI's shim-tests job, and the `check-version` job in `release.yml` runs `--check --expect "${REF_NAME#v}"` before any build, so a tag that differs from the version files never reaches a build or the npm publish. See `AGENTS.md` § "Version sync — seven files, one version".
+
+A pre-commit auto-sync hook was considered and dropped: a release agent running one command removes the "find all seven places" step directly, a hook only runs where `npm install` set `core.hooksPath` and is skipped by `--no-verify` and web edits, and CI already catches what a bypassed hook would miss.
+
+History (the reason this exists): `.copilot-plugin/plugin.json` was stuck at `0.1.0` across many releases; `.claude-plugin/plugin.json` and `.cursor-plugin/plugin.json` stayed on `0.7.2` through the strip series while `package.json` advanced to `0.8.0-beta.3`; `package-lock.json`'s top-level `version` drifted until the beta.6 lockfile regeneration; and `hermes-plugin/plugin.yaml` stayed on `1.4.0` through the 2.0.0 release.
+
+### ~~Scrub Stale TS References in .NET Source Comments~~
+
+Done (issue #66). The 132 lines in 86 `.cs`/`.fs` files under `src/` and `tests/` (the entry's 89 was an old count) that named the deleted TypeScript implementation (`src-ts/...`) or `bun:sqlite`, including the `SqliteConnection` summary, were deleted when they only said where code came from and rewritten without the old path when they also explained behaviour. Only comment lines changed. `StaleLineageReferenceTests` (`tests/TotalRecall.Infrastructure.Tests`) now fails, naming file and line, if either string comes back into a `.cs` or `.fs` file under `src/` or `tests/`. Other lineage wording that names neither string (for example "Plan 5 Task 5.3a" or "the TS implementation") was left alone.
+
+### Windows install robustness: retry-on-EPERM upstream in Claude Code
+
+When Claude Code's plugin update path uses `source: npm`, it does `npm install` into a temp dir and then `fs.rename(temp, dest)`. On Windows this reliably trips `EPERM: operation not permitted, rename` when Windows Defender holds a handle on a freshly-extracted `.exe` (mid-scan window is typically 50–500ms). The rename has no retry logic.
+
+This is a one-line fix in Claude Code's plugin installer — wrap the rename in exponential backoff (100ms, 200ms, 400ms, …) on `EPERM` or `EBUSY` codes. Standard pattern used by `rimraf`, `fs-extra`, npm itself.
+
+**Action:** File a GitHub issue against Claude Code with a clean repro (see the beta.6 dogfood trace in this session's history for details). Benefits every npm-distributed plugin on Windows, not just total-recall. Zero cost to us.
+
+**Workaround until fixed:** See `AGENTS.md` § "Windows EPERM workaround" (manual `mv` from WSL). Also documented in the beta dogfood mechanics section.
+
+### Windows install robustness: Authenticode code signing for the AOT binary
+
+Defender skips full scans on binaries signed by trusted Authenticode publishers, which eliminates the mid-extract scan window that triggers the EPERM rename above. Signed binaries also make SmartScreen warnings disappear after a few hundred user installs.
+
+Requirements:
+- EV code-signing certificate (~$300–$500/year). EV certs are whitelisted faster than DV.
+- Signing infrastructure: HSM-bound key for EV, or hardware token for DV.
+- `signtool` + a signing step in `release.yml`'s win-x64 matrix leg before the archive staging.
+
+Deferred until the user count justifies the cost. A good milestone trigger would be "first reported Windows Defender false-positive from a real user on a stable release."
+
+**Files:** `.github/workflows/release.yml`
+
+### Windows install robustness: per-platform npm packages (esbuild model)
+
+Instead of shipping all four RID binaries in a single ~60 MB npm tarball, split into:
+
+- `@strvmarv/total-recall` (main package, ~5 MB: bin/start.js, scripts/, skills/, agents/, hooks/, models/, no platform binaries)
+- `@strvmarv/total-recall-linux-x64` (~15 MB: just the linux-x64 binary + siblings)
+- `@strvmarv/total-recall-linux-arm64`, `@strvmarv/total-recall-osx-arm64`, `@strvmarv/total-recall-win-x64`
+
+The main package lists the four platform packages as `optionalDependencies` with `os`/`cpu` filters. npm only installs the matching one per host. `bin/start.js` uses `require.resolve('@strvmarv/total-recall-' + rid)` to find the binary at runtime.
+
+This is the industry-standard pattern for npm-distributed native CLIs — used by esbuild, sharp, biome, swc. Benefits:
+
+- Each user install is ~15 MB (one platform) instead of ~60 MB (four platforms)
+- Defender only has one binary to scan per install, which reduces the lock window enough to probably avoid the EPERM rename
+- Windows install is substantially faster
+- The main package extracts cleanly in milliseconds because it has no large .exe files
+
+Tradeoffs:
+- Publish 5 npm packages instead of 1 per release; release.yml publish job gets a per-platform-package loop
+- Version lockstep across 5 packages instead of 1 (already a version-sync challenge we don't fully automate)
+- `bin/start.js` has to do require.resolve instead of direct relative path lookup
+
+Meaningful refactor — probably 1-2 days of work plus a beta cycle to validate. Worth tracking but not urgent until Windows user count grows.
+
+**Files:** `package.json`, `bin/start.js`, `.github/workflows/release.yml`, new per-platform package scaffolding
+
+### ~~Web UI: server-side Insights engine~~ — done in v3.4.0
+
+Shipped as the `insights` MCP tool (`src/TotalRecall.Server/Handlers/InsightsHandler.cs`) + a rebuilt Insights page: near-duplicate clusters (same-tier cosine over the live set), pin-promotion candidates (high `access_count`, unpinned), retrieval gaps, a recall-vs-threshold curve (`Metrics.Compute` at several thresholds over one load of `retrieval_events`), and a self-explaining health score with a four-part breakdown. The page (`src/TotalRecall.Web/ClientApp/src/lib/insights.ts` + `pages/Insights.tsx`) maps the payload to actionable cards (merge near-dups via `memory_delete`, pin via `memory_pin`, threshold tuning via `config_set`).
+
+**Follow-ups deferred from this work:**
+
+- **Cross-tier near-duplicate clustering.** v1 near-dup detection is same-tier only (the vec0 search is scoped to one tier table), so identical content split across hot/warm tiers won't cluster together. A cross-tier pass would compare each live-set entry against the merged set rather than just its own tier.
+  **Files:** `src/TotalRecall.Server/Handlers/InsightsHandler.cs` (`ComputeNearDuplicates`)
+- **Eval Compare snapshot picker.** The Eval page's Compare section takes free-text snapshot ids because there is no snapshot-list tool, so users must already know the ids. A snapshot-list capability would let the UI offer a dropdown.
+  **Files:** new server handler/tool to enumerate config snapshots, `src/TotalRecall.Web/Api/ToolAllowlist.cs`, `src/TotalRecall.Web/ClientApp/src/pages/Eval.tsx`
+
+### Web UI: editable/persisted pricing config
+
+The Usage section uses a bundled static pricing table for cost estimates. A `[pricing]` config section would let operators supply their own model pricing (e.g. enterprise agreements, region-specific rates) and persist it alongside `config.toml`. The Config page in the UI would expose an editor for these fields.
+
+**Files:** `src/TotalRecall.Core/Config.fs` (add `PricingConfig`), `src/TotalRecall.Infrastructure/Config/` (TOML loader), `src/TotalRecall.Web/ClientApp/src/lib/pricing.ts` (consume from config API), `src/TotalRecall.Web/ClientApp/src/pages/Config.tsx`
+
+### Web UI: usage activity heatmap
+
+The Dashboard Trends card shows daily-rollup data. A GitHub-style heatmap (activity by day-of-week × hour-of-day) would surface session timing patterns — useful for understanding when your AI assistant is most active. Requires an hourly `GroupBy` on `usage_events` that the current `usage_status` tool does not return.
+
+**Files:** `src/TotalRecall.Server/Handlers/UsageStatusHandler.cs` (add hourly breakdown option), `src/TotalRecall.Web/ClientApp/src/components/dashboard/` (new `ActivityHeatmapCard.tsx`)
+
+### Web UI: per-project trend sparklines
+
+The Dashboard lists recent activity but has no per-project comparison view. Sparklines (e.g. weekly token spend per project over 4 weeks) would make cross-project trends visible without switching to the full Usage section.
+
+**Files:** `src/TotalRecall.Server/Handlers/UsageStatusHandler.cs`, `src/TotalRecall.Web/ClientApp/src/components/dashboard/TrendsCard.tsx`
+
+### Web UI: Cortex remote phase
+
+In Cortex mode the web UI connects to the local plugin process as usual, but some data (team KB, remote usage, connector-ingested documents) lives on the remote Cortex instance. The Cortex-facing API endpoints are not yet proxied through the web UI server. Requires either a proxy endpoint or a direct Cortex API token flow surfaced in Config.
+
+**Files:** `src/TotalRecall.Web/` (new Cortex-proxy middleware), `src/TotalRecall.Web/ClientApp/src/lib/api.ts`
+
+### Web UI: SSE / live push
+
+All UI sections poll on-demand or on page load. Real-time updates (e.g. "new memory stored", "compaction completed", "re-index progress") would require SSE or WebSocket push from the server. The current design explicitly deferred this to keep the v1 architecture simple.
+
+**Files:** `src/TotalRecall.Web/WebUiServer.cs` (add SSE endpoint), `src/TotalRecall.Web/ClientApp/src/lib/` (new `useEventSource.ts`)
+
+### MemoryStoreHandler ignores caller entryType for the column
+
+`memory_store` parses and validates the `entryType` argument into metadata JSON but hardcodes `EntryType.Preference` for the `entry_type` column in the `InsertWithEmbedding` call. `memory_extract` (Phase 3) maps the validated string to the correct `EntryType` discriminated union value and writes it to the column — the two siblings diverge. Fix `MemoryStoreHandler` to map the validated string to the `EntryType` DU (consider per-type decay accuracy impact on existing rows that were silently written as Preference). Found during Phase 3 code review.
+
+**Files:** `src/TotalRecall.Server/Handlers/MemoryStoreHandler.cs` (`InsertWithEmbedding` call), `src/TotalRecall.Server/Handlers/MemoryExtractHandler.cs` (reference implementation)
+
+## Follow-ups deferred from the MCP bootstrap shim
+
+Items identified during the MCP bootstrap shim implementation but intentionally deferred.
+
+### Mode-aware catalog
+
+`catalog.json` captures the local/sqlite tool surface (42 core + mode-dependent tools). Postgres mode exposes fewer tools, so the pre-engine `tools/list` served by the shim is cosmetically broad until the engine starts and emits `notifications/tools/list_changed` with the authoritative mode-specific list. Tool calls always proxy correctly once the engine is up — only the initial discovery list is approximate. A follow-up would generate and commit a separate `catalog-postgres.json` and have the shim select the right one based on config/env.
+
+**Files:** `bin/shim/server-surface.js`, `.github/workflows/release.yml` (catalog generation step), `catalog.json`
+
+### Mid-session engine hot-swap
+
+The shim supervises and restarts the engine on crash, but currently requires the MCP host to reconnect (or wait for the shim restart) to pick up a new engine version. A follow-up would allow provisioning a new engine version in the background and hot-swapping the proxy target without dropping the MCP connection, enabling zero-downtime upgrades mid-session.
+
+**Files:** `bin/shim/orchestrator.js`, `bin/shim/engine-proxy.js`, `bin/shim/provisioner.js`
+
+### Richer provisioning progress surfaced to the user
+
+During provisioning the shim returns a minimal `{ "status": "not_ready", "phase": "provisioning" }` result. A follow-up would include download progress (bytes transferred / total, percentage) so the host or skill can surface a real-time progress indicator to the user rather than a plain "still starting" message.
+
+**Files:** `bin/shim/provisioner.js`, `bin/shim/server-surface.js`, `skills/using-total-recall/SKILL.md`
+
+## Onboarding
+
+### First-run tutorial (all harnesses)
+
+New users need to learn how to use memory: what gets stored, what comes back, and how to steer it with pin, forget and search. Today that teaching is the startup announcement plus the `help` command in `skills/commands/SKILL.md`. A guided first-run walkthrough would help on every harness, and matters most for newer ones such as pi, whose users assemble their own setup and have no plugin-marketplace onboarding to lean on.
+
+Sketch (a guess, not a decision): the engine records first-run state (a `_meta` flag set once the tutorial is finished or dismissed), `session_start` reports it, and the shared skill text tells the model to offer a short guided walkthrough. The logic lives in the engine and the skill, not in any host's hooks, so every harness gets it. Open questions: what the walkthrough covers, how a user skips or replays it, and whether it shows in the web UI too. Raised while brainstorming pi host support; brainstorm it as its own design after that lands.
+
+**Files:** `skills/commands/SKILL.md`, `skills/using-total-recall/SKILL.md`, `src/TotalRecall.Server/` (`session_start` handler, `_meta` flag), `src/TotalRecall.Web/` (optional)
+
+## pi host follow-ups
+
+### pi: reset the pinned-floor throttle on `session_compact`
+
+After a compaction the pinned block that the floor last injected may be gone from the transcript, yet the floor's throttle state (keyed by session id) still counts from that injection, so the next floor can be up to `floor_every_n_turns` prompts away. Whether pi keeps the session id across `/compact` is not yet verified (the spike's compaction did not run). Verify, and if the id persists, have the extension reset or force the floor on `session_compact` (this needs a small CLI change, e.g. a reset flag on `pinned-floor`).
+
+**Files:** `pi/extension.js`, `src/TotalRecall.Cli/Commands/PinnedFloorCommand.cs`, `src/TotalRecall.Infrastructure/Memory/PinnedFloorState.cs`
+
+## Follow-ups from the Codex CLI host
+
+### Claude Code `.mcp.json` sets `cwd` to the plugin root
+
+`.mcp.json` runs the server with `"cwd": "${CLAUDE_PLUGIN_ROOT}"`. The engine resolves the current project (project-scoped pins, project-docs ingest) from its working directory (`SessionLifecycle` uses `Environment.CurrentDirectory`), so under Claude Code the server-side `session_start` may resolve project scope against the plugin directory (fail-closed to global pins only). The per-turn floor is unaffected: it takes the cwd from the hook payload. Verify on a real Claude Code session and, if confirmed, drop the `cwd` (the Codex and pi registrations deliberately set none).
+
+## Follow-ups from the Copilot CLI host
+
+### Copilot CLI: session directory for the MCP server
+
+Same root cause as the Claude Code `.mcp.json` item above, now with evidence: Copilot starts the server in the plugin directory, so server-side `session_start` never injects pins scoped to the user's repo while the floor does (observed 2026-11-10). Copilot records the session directory in `session-state/<id>/workspace.yaml`, but the file keeps the original directory after `--continue` from another one, so a shim `chdir` was rejected. Revisit if Copilot exposes the session cwd to MCP servers; `cwd: "."` resolves to the session directory in Copilot but would have to live in the shared `.mcp.json`.
+
+### Copilot CLI: unobserved, deferred or fragile
+
+- The floor relies on `userPromptSubmitted` command hooks adding `additionalContext`, which Copilot's hooks docs say is ignored. If a future build drops it, move the floor to `userPromptTransformed` `modifiedTransformedPrompt` (documented, observed working) and re-run the cadence check.
+- macOS and Linux were not run: the POSIX assumptions are the braced `${PLUGIN_ROOT}` substitution through `sh` and `COPILOT_HOME` resolution. The interactive tool-approval prompt and `copilot plugin update` for a git-sourced marketplace were not observed.
+- `/compact` drops the startup instructions from context and fires no hook; only the floor re-asserts pins. Revisit if Copilot adds a compaction hook that can carry context.
+- No `SessionEnd` nudge (Copilot ignores sessionEnd output), no first-run tutorial.
+- `copilot/hook.js` duplicates three small helpers from `codex/hook.js` (`stripFrontmatter`, `readStdin`, `isMain`); extract shared host-hook helpers (tracked under "Follow-ups from the Cursor CLI host").
+- The `COPILOT_CLI` branches in `hooks/*/run.sh` are dead under the Copilot plugin (the manifest's hooks path replaces `hooks/hooks.json`); remove them if no hand-wired setup needs them.
+
+### Codex CLI: unobserved or deferred
+
+- Interactive trust flow (`/hooks` review) and interactive MCP tool approval were not observed (no pseudo-terminal); INSTALL.md follows Codex's documentation there.
+- macOS and Linux were not run: the POSIX assumptions are `~/.codex` resolution, lowercase proxy variables, and Codex substituting the braced `${PLUGIN_ROOT}` through `sh`. Run the plugin on both.
+- `SessionEnd` (3 s clamp, no user-visible output) and `fork` (history already carries the instructions) are deliberately not mapped; revisit if Codex gives `SessionEnd` a visible surface.
+- A first-run tutorial remains deferred for all harnesses (see Onboarding).
+
+## Follow-ups from the Cursor CLI host
+
+### Cursor CLI: unobserved, deferred or fragile
+
+- Live runs stopped when the personal account hit Cursor's free-plan limit (resets 2026-12-07). Unobserved: a subagent run (is its `generation_id` the parent's? an extra counted turn otherwise), parallel tool calls inside Cursor (covered by a real-process race test and a unit test), a non-ASCII workspace path through Cursor's PowerShell stdin to the floor, `/compact` (do the instructions and pins survive?), the unapproved-server refusal text, the marketplace/`/plugins` install path (which manifest does Cursor load from a Claude-format marketplace?), macOS/Linux, the desktop IDE agent (its hook set differs: `beforeSubmitPrompt`/`stop` fire there). Re-run with a Pro account or after the reset.
+- The first `session_start` on a fresh store with a very large other-tool history (about 87 s here) exceeds Cursor's 60 s MCP request limit and a plugin cannot raise it. Options: make the engine's first `session_start` return a "warming" result quickly and finish the import in the background, or move the history import out of `session_start`.
+- The floor depends on `postToolUse` `additional_context`. If a future Cursor CLI fires a context-capable prompt hook (`beforeSubmitPrompt` today cannot inject and never fires in the CLI), move the floor there so turns without a tool are covered too.
+- `hooks/hooks-cursor.json` and the `CURSOR_PLUGIN_ROOT` branches in `hooks/*/run.sh` are dead under the Cursor plugin; remove them if no hand-wired setup needs them.
+- The four hook files (`pi/extension.js` helpers, `codex/hook.js`, `copilot/hook.js`, `cursor/hook.js`) now duplicate `stripFrontmatter`, `readStdin`, `isMain` (and `storeEnvStrip` in two): extract shared host-hook helpers with a design that cannot crash a hook when the shared file is missing (a static import would).
+- A test harness lesson: `cursor-agent login` writes the real `%APPDATA%\Cursor\auth.json`; fingerprint before logging in and prefer a throwaway OS user.
+- Cursor CLI on Windows from Git Bash blocks every tool call (a Cursor bug); contributors run it from PowerShell or cmd.

@@ -1,0 +1,107 @@
+// src/TotalRecall.Infrastructure/Eval/SensitiveContentScanner.cs
+//
+// Guards the eval_grow accept path. Candidates are captured from REAL
+// retrieval misses, so their query text and surfaced top-result content can
+// carry secrets, PII, or caller-internal identifiers. Before such a candidate
+// is appended to the (public, committed) benchmark corpus, it is scanned here.
+//
+// Detection has two layers:
+//   1. Hardcoded generic detectors (emails, common secret/token shapes,
+//      private-key blocks) — safe to ship in a public repo because they name
+//      shapes, not any specific organization's data.
+//   2. A caller-supplied list of internal terms (config: eval.grow.sensitive_terms,
+//      default empty). These deliberately live in the user's LOCAL config, never
+//      hardcoded here — baking internal product names into the public source
+//      would itself be a leak.
+//
+// Reasons are category labels, never the matched value, so scanning a secret
+// does not echo it back into logs or tool responses.
+//
+// A second consumer (git sync, later milestones) calls ScanSecrets, which runs
+// only the token and private-key detectors; the detectors are selectable via
+// the Detectors flags and Scan(text, terms) still runs all of them.
+
+using System;
+using System.Collections.Generic;
+using System.Text.RegularExpressions;
+
+namespace TotalRecall.Infrastructure.Eval;
+
+/// <summary>The built-in detectors a scan may run (internal terms are separate: they come from the caller).</summary>
+[Flags]
+public enum Detectors
+{
+    None = 0,
+    Email = 1,
+    Token = 2,
+    PrivateKey = 4,
+    All = Email | Token | PrivateKey,
+}
+
+/// <summary>
+/// Detects secrets / PII / configured internal terms in text destined for the
+/// public benchmark corpus. Returns category reasons (never the matched value).
+/// </summary>
+public static class SensitiveContentScanner
+{
+    // Interpreted (not Compiled) regex: RegexOptions.Compiled emits IL at
+    // runtime and is not NativeAOT-safe. These run only on eval_grow accept,
+    // over short strings, so interpreted matching is more than fast enough.
+    private static readonly (Detectors Flag, string Reason, Regex Pattern)[] _detectors =
+    {
+        (Detectors.Email, "email address",
+            new Regex(@"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
+        (Detectors.Token, "API token or secret",
+            new Regex(@"gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_\-]{16,}|xox[baprs]-[A-Za-z0-9\-]{10,}|sk-[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}")),
+        (Detectors.PrivateKey, "private key block",
+            new Regex(@"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    };
+
+    /// <summary>
+    /// Scan <paramref name="text"/> for secrets, PII, and any of
+    /// <paramref name="internalTerms"/> (case-insensitive substring, blanks
+    /// ignored). Returns an empty list when clean.
+    /// </summary>
+    public static IReadOnlyList<string> Scan(string? text, IReadOnlyCollection<string>? internalTerms) =>
+        Scan(text, internalTerms, Detectors.All);
+
+    /// <summary>
+    /// The same scan with only the chosen built-in <paramref name="detectors"/> (the internal terms always run).
+    /// Reasons come in the order email, token, private key, internal term.
+    /// </summary>
+    public static IReadOnlyList<string> Scan(string? text, IReadOnlyCollection<string>? internalTerms, Detectors detectors)
+    {
+        if (string.IsNullOrEmpty(text)) return Array.Empty<string>();
+
+        var reasons = new List<string>();
+        foreach (var (flag, reason, pattern) in _detectors)
+        {
+            if ((detectors & flag) != 0 && pattern.IsMatch(text)) reasons.Add(reason);
+        }
+
+        if (internalTerms is not null)
+        {
+            foreach (var raw in internalTerms)
+            {
+                if (string.IsNullOrWhiteSpace(raw)) continue;
+                if (text.Contains(raw.Trim(), StringComparison.OrdinalIgnoreCase))
+                {
+                    // Category label only — never echo the matched term, in case
+                    // an operator put a real secret in sensitive_terms. One reason
+                    // is enough regardless of how many terms matched.
+                    reasons.Add("internal term");
+                    break;
+                }
+            }
+        }
+
+        return reasons;
+    }
+
+    /// <summary>
+    /// Tokens and private keys only, with no internal terms: the check git sync runs on text it is about to publish to
+    /// the user's own private repository. Email addresses are not flagged (a memory may name a person).
+    /// </summary>
+    public static IReadOnlyList<string> ScanSecrets(string? text) =>
+        Scan(text, null, Detectors.Token | Detectors.PrivateKey);
+}

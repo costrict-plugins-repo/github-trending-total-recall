@@ -1,0 +1,35 @@
+namespace TotalRecall.Infrastructure.Embedding;
+
+/// <summary>
+/// Text embedder interface. Accepts raw text (tokenization is the
+/// implementation's responsibility) and returns a dense float vector.
+/// Implementations are expected to lazily load any heavyweight resources
+/// (models, vocab) on the first call.
+/// </summary>
+public interface IEmbedder
+{
+    /// <summary>
+    /// Embed a single text string into a dense vector of length equal to the
+    /// underlying model's hidden size. The returned array is L2-normalized so
+    /// callers can treat dot-products as cosine similarities.
+    /// </summary>
+    float[] Embed(string text);
+
+    /// <summary>
+    /// Embed a search QUERY. Implementations that use an asymmetric retrieval
+    /// instruction (e.g. bge's "Represent this sentence…") prepend it here;
+    /// document embedding stays on <see cref="Embed"/>. The default is
+    /// symmetric (no prefix) so remote providers — which handle asymmetry
+    /// server-side — and test doubles need no change.
+    /// </summary>
+    float[] EmbedQuery(string text) => Embed(text);
+
+    /// <summary>
+    /// Identity of the model this embedder produces vectors for. Used by
+    /// <see cref="EmbedderFingerprint"/> to detect silent model swaps on
+    /// existing databases. Implementations MUST return a stable value that
+    /// does not require loading heavy resources — callers may invoke this
+    /// at startup before any <see cref="Embed"/> call.
+    /// </summary>
+    EmbedderDescriptor Descriptor { get; }
+}

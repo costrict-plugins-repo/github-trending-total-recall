@@ -1,0 +1,361 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using TotalRecall.Core;
+using TotalRecall.Infrastructure.Embedding;
+using TotalRecall.Infrastructure.Search;
+using TotalRecall.Infrastructure.Storage;
+using TotalRecall.Infrastructure.Telemetry;
+
+namespace TotalRecall.Infrastructure.Importers;
+
+/// <summary>
+/// Outcome of a single <see cref="ImportUtils.ImportMarkdownFile"/> call.
+/// </summary>
+public enum ImportFileStatus
+{
+    Imported,
+    Skipped,
+    Errored,
+}
+
+/// <summary>
+/// Result of <see cref="ImportUtils.ImportMarkdownFile"/>. For
+/// <see cref="ImportFileStatus.Errored"/>, <see cref="Error"/> carries a
+/// human-readable message in the form <c>"{filePath}: {ex.Message}"</c>.
+/// </summary>
+public sealed record ImportFileOutcome(
+    ImportFileStatus Status,
+    string? Error = null);
+
+/// <summary>
+/// Result of <see cref="ImportUtils.InsertOrRepairMemory"/>: the entry's id,
+/// the tier it ended up in, and whether an existing (half-imported) entry was
+/// repaired instead of a new one being inserted.
+/// </summary>
+internal readonly record struct MemoryImportResult(string EntryId, Tier Tier, bool Repaired);
+
+/// <summary>
+/// Parsed frontmatter block from a markdown file.
+/// All fields are optional because importers parse a wide variety of files.
+/// </summary>
+public sealed record Frontmatter(
+    string? Name = null,
+    string? Description = null,
+    string? Type = null);
+
+/// <summary>
+/// Result of <see cref="ImportUtils.ParseFrontmatter"/>: the parsed
+/// frontmatter (or <c>null</c> if the file had no <c>---</c> header) and
+/// the content body that follows.
+/// </summary>
+public sealed record FrontmatterParseResult(
+    Frontmatter? Frontmatter,
+    string Content);
+
+/// <summary>
+/// Static helpers shared by the 7 host importers. The content-hash / dedupe /
+/// log-write helpers live in <c>TotalRecall.Infrastructure.Telemetry.ImportLog</c>.
+/// </summary>
+public static class ImportUtils
+{
+    private const string Marker = "---\n";
+
+    /// <summary>
+    /// Parse a markdown file's YAML-ish frontmatter block. Mirrors the TS
+    /// <c>parseFrontmatter</c> regex
+    /// <c>/^---\n([\s\S]*?)\n---\n([\s\S]*)$/</c> — only recognizes
+    /// <c>name</c>, <c>description</c>, and <c>type</c> keys; ignores
+    /// everything else. CRLF line endings are normalized to LF before
+    /// parsing, matching the TS behaviour.
+    /// </summary>
+    public static FrontmatterParseResult ParseFrontmatter(string raw)
+    {
+        ArgumentNullException.ThrowIfNull(raw);
+        var normalised = raw.Replace("\r\n", "\n");
+
+        if (!normalised.StartsWith(Marker, StringComparison.Ordinal))
+        {
+            return new FrontmatterParseResult(null, normalised);
+        }
+
+        var bodyStart = Marker.Length;
+        // TS regex requires \n---\n as the closing delimiter.
+        var closing = normalised.IndexOf("\n" + Marker, bodyStart, StringComparison.Ordinal);
+        if (closing < 0)
+        {
+            return new FrontmatterParseResult(null, normalised);
+        }
+
+        var body = normalised.Substring(bodyStart, closing - bodyStart);
+        var content = normalised.Substring(closing + 1 + Marker.Length);
+
+        string? name = null;
+        string? description = null;
+        string? type = null;
+
+        foreach (var line in body.Split('\n'))
+        {
+            // TS line regex: /^(\w+):\s*(.*)$/
+            var colonIdx = line.IndexOf(':');
+            if (colonIdx <= 0) continue;
+            var key = line.Substring(0, colonIdx);
+            if (!IsWordChars(key)) continue;
+            // \s* after the colon then everything until end-of-line, then
+            // .trim() in TS.
+            var value = line.Substring(colonIdx + 1).Trim();
+            switch (key)
+            {
+                case "name": name = value; break;
+                case "description": description = value; break;
+                case "type": type = value; break;
+                // Other keys are silently ignored, matching the TS (the
+                // TS assigns them but the Frontmatter interface only
+                // exposes the three keys we handle here).
+            }
+        }
+
+        return new FrontmatterParseResult(new Frontmatter(name, description, type), content);
+    }
+
+    /// <summary>
+    /// Standard markdown-import pipeline shared across host importers:
+    /// read file → hash → dedupe check → (optionally) parse frontmatter →
+    /// insert entry → embed → insert vector → log import row.
+    ///
+    /// Returns one of:
+    /// <list type="bullet">
+    ///   <item><see cref="ImportFileStatus.Imported"/> on success.</item>
+    ///   <item><see cref="ImportFileStatus.Skipped"/> if the content hash
+    ///     already exists in <c>import_log</c>.</item>
+    ///   <item><see cref="ImportFileStatus.Errored"/> with an error message
+    ///     on any exception during read/parse/insert/embed/log.</item>
+    /// </list>
+    ///
+    /// Concrete importers compose this with their per-importer routing
+    /// logic (tier/type, base tag selection, source-tool DU).
+    ///
+    /// When <paramref name="parseFrontmatter"/> is false (Copilot CLI plan.md,
+    /// Cline global rules), the file content is inserted verbatim and
+    /// <paramref name="prependFrontmatterName"/> has no effect.
+    /// </summary>
+    public static ImportFileOutcome ImportMarkdownFile(
+        IStore store,
+        IEmbedder embedder,
+        IVectorSearch vectorSearch,
+        IImportLog importLog,
+        string sourceToolName,
+        SourceTool sourceToolDu,
+        string filePath,
+        Tier tier,
+        ContentType contentType,
+        IReadOnlyList<string> baseTags,
+        bool prependFrontmatterName,
+        bool parseFrontmatter = true,
+        string? project = null)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        ArgumentNullException.ThrowIfNull(embedder);
+        ArgumentNullException.ThrowIfNull(vectorSearch);
+        ArgumentNullException.ThrowIfNull(importLog);
+        ArgumentNullException.ThrowIfNull(filePath);
+        ArgumentNullException.ThrowIfNull(baseTags);
+
+        try
+        {
+            var raw = File.ReadAllText(filePath);
+            var hash = ImportLog.ContentHash(raw);
+
+            if (importLog.IsAlreadyImported(hash))
+            {
+                return new ImportFileOutcome(ImportFileStatus.Skipped);
+            }
+
+            string content;
+            string? summary;
+            IReadOnlyList<string> tags;
+
+            if (parseFrontmatter)
+            {
+                var parsed = ParseFrontmatter(raw);
+                content = parsed.Content;
+                // When prependFrontmatterName is false the caller has
+                // opted out of frontmatter-driven metadata entirely —
+                // fixed tags, no summary from description. This matches
+                // the TS "only destructure content" pattern used by
+                // ClaudeCode knowledge and OpenCode global AGENTS.md.
+                if (prependFrontmatterName)
+                {
+                    summary = parsed.Frontmatter?.Description;
+                    tags = !string.IsNullOrEmpty(parsed.Frontmatter?.Name)
+                        ? new[] { parsed.Frontmatter!.Name! }.Concat(baseTags).ToArray()
+                        : baseTags.ToArray();
+                }
+                else
+                {
+                    summary = null;
+                    tags = baseTags.ToArray();
+                }
+            }
+            else
+            {
+                content = raw;
+                summary = null;
+                tags = baseTags.ToArray();
+            }
+
+            var opts = new InsertEntryOpts(
+                Content: content,
+                Summary: summary,
+                Source: filePath,
+                SourceTool: sourceToolDu,
+                Project: project,
+                Tags: tags,
+                EntryType: EntryType.Imported);
+
+            if (contentType.IsMemory)
+            {
+                // Memories get a hash-derived id and a repair-on-retry import
+                // (git sync: the same host memory is the same entry on every
+                // machine, and a half-finished import is completed, not
+                // duplicated). Knowledge keeps random ids.
+                InsertOrRepairMemory(
+                    store, embedder, vectorSearch, importLog,
+                    sourceToolName, filePath, hash, tier, opts);
+            }
+            else
+            {
+                var entryId = store.Insert(tier, contentType, opts);
+                var embedding = embedder.Embed(content);
+                vectorSearch.InsertEmbedding(tier, contentType, entryId, embedding);
+                importLog.LogImport(sourceToolName, filePath, hash, entryId, tier, contentType);
+            }
+
+            return new ImportFileOutcome(ImportFileStatus.Imported);
+        }
+        catch (Exception ex)
+        {
+            return new ImportFileOutcome(
+                ImportFileStatus.Errored,
+                $"{filePath}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Insert a <b>memory</b> import with a hash-derived id, or repair it when
+    /// an earlier run was interrupted. The caller has already checked
+    /// <see cref="IImportLog.IsAlreadyImported"/>. Steps:
+    /// <list type="number">
+    ///   <item>derive the id with <see cref="ImportIds.FromHash"/>;</item>
+    ///   <item>look for an entry with that id in the target tier, then in the
+    ///     other two tiers (Hot, Warm, Cold), and if one exists skip the insert
+    ///     and use the tier it is in;</item>
+    ///   <item>otherwise insert it with the derived id; if that insert throws
+    ///     (two importers racing) and the entry is now there, carry on as if
+    ///     it had been found, else rethrow;</item>
+    ///   <item>embed the <b>stored</b> content when the entry already existed
+    ///     (it may have been edited or arrived by sync), else the imported
+    ///     content, and insert the vector for the entry's current tier (the
+    ///     vector insert replaces an orphan row, so it is safe to repeat);</item>
+    ///   <item>write the <c>import_log</c> row for the entry's current tier
+    ///     (<c>INSERT OR IGNORE</c>).</item>
+    /// </list>
+    /// A repaired import counts as imported (the entry was not complete before).
+    /// It is not a transaction because in cortex mode the importers write
+    /// through <c>RoutingStore</c>, which cannot share one.
+    /// </summary>
+    internal static MemoryImportResult InsertOrRepairMemory(
+        IStore store,
+        IEmbedder embedder,
+        IVectorSearch vectorSearch,
+        IImportLog importLog,
+        string sourceToolName,
+        string sourcePath,
+        string contentHash,
+        Tier tier,
+        InsertEntryOpts opts)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        ArgumentNullException.ThrowIfNull(embedder);
+        ArgumentNullException.ThrowIfNull(vectorSearch);
+        ArgumentNullException.ThrowIfNull(importLog);
+        ArgumentNullException.ThrowIfNull(opts);
+
+        var id = ImportIds.FromHash(contentHash);
+        var existing = FindMemory(store, id, tier);
+        var repaired = existing is not null;
+
+        if (existing is null)
+        {
+            try
+            {
+                store.Insert(tier, ContentType.Memory, opts with { Id = id });
+            }
+            catch (Exception)
+            {
+                // Two importers racing: the entry may exist now. A failure of
+                // this lookup must not replace the original insert failure.
+                (Tier Tier, Entry Entry)? found = null;
+                try { found = FindMemory(store, id, tier); }
+                catch (Exception) { /* keep the original failure */ }
+                if (found is null) throw;
+                existing = found;
+                repaired = true;
+            }
+        }
+
+        var entryTier = existing?.Tier ?? tier;
+        var content = existing?.Entry.Content ?? opts.Content;
+
+        var embedding = embedder.Embed(content);
+        vectorSearch.InsertEmbedding(entryTier, ContentType.Memory, id, embedding);
+        importLog.LogImport(
+            sourceToolName, sourcePath, contentHash, id, entryTier, ContentType.Memory);
+
+        return new MemoryImportResult(id, entryTier, repaired);
+    }
+
+    private static (Tier Tier, Entry Entry)? FindMemory(IStore store, string id, Tier targetTier)
+    {
+        var order = new List<Tier> { targetTier };
+        foreach (var t in new[] { Tier.Hot, Tier.Warm, Tier.Cold })
+            if (!t.Equals(targetTier)) order.Add(t);
+
+        foreach (var t in order)
+        {
+            var entry = store.Get(t, ContentType.Memory, id);
+            if (entry is not null) return (t, entry);
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Updates the running import counters based on an <see cref="ImportFileOutcome"/>.
+    /// Small helper to DRY up the aggregation switch at call sites.
+    /// </summary>
+    public static void Tally(
+        ImportFileOutcome outcome,
+        ref int imported,
+        ref int skipped,
+        List<string> errors)
+    {
+        switch (outcome.Status)
+        {
+            case ImportFileStatus.Imported: imported++; break;
+            case ImportFileStatus.Skipped: skipped++; break;
+            case ImportFileStatus.Errored: errors.Add(outcome.Error!); break;
+        }
+    }
+
+    /// <summary>\w in JS regex: letters, digits, underscore.</summary>
+    private static bool IsWordChars(string s)
+    {
+        if (s.Length == 0) return false;
+        foreach (var c in s)
+        {
+            if (!(char.IsLetterOrDigit(c) || c == '_')) return false;
+        }
+        return true;
+    }
+}

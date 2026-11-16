@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>TotalRecall.Cli</RootNamespace>
+    <AssemblyName>TotalRecall.Cli</AssemblyName>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsAotCompatible>true</IsAotCompatible>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Spectre.Console" Version="0.55.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\TotalRecall.Core\TotalRecall.Core.fsproj" />
+    <ProjectReference Include="..\TotalRecall.Infrastructure\TotalRecall.Infrastructure.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,826 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Text;
+using System.Text.RegularExpressions;
+using Microsoft.Data.Sqlite;
+using Microsoft.FSharp.Collections;
+using Microsoft.FSharp.Core;
+using TotalRecall.Core;
+using MsSqliteConnection = Microsoft.Data.Sqlite.SqliteConnection;
+
+namespace TotalRecall.Infrastructure.Storage;
+
+/// <summary>
+/// Tier-aware CRUD over the 6 content tables, using <see cref="Microsoft.Data.Sqlite"/>
+/// with parameterized queries. Table names are resolved from the F# Core
+/// <see cref="Tier"/> / <see cref="ContentType"/> DUs via
+/// <see cref="MigrationRunner.TableName"/>.
+///
+/// Two constructors are offered: a production path that opens a new
+/// connection from a db path, and a test-friendly path that borrows an
+/// already-opened connection and skips migrations. The borrowed-connection
+/// form does NOT own disposal.
+/// </summary>
+public sealed class SqliteStore : IStore, IMetaStore, IDisposable
+{
+    private readonly MsSqliteConnection _conn;
+    private readonly bool _ownsConnection;
+
+    /// <summary>
+    /// Production constructor. Opens a new connection at <paramref name="dbPath"/>,
+    /// loads sqlite-vec, applies pragmas, and runs all pending migrations.
+    /// </summary>
+    public SqliteStore(string dbPath)
+    {
+        _conn = SqliteConnection.Open(dbPath);
+        _ownsConnection = true;
+        MigrationRunner.RunMigrations(_conn);
+        // Sweep any orphan vec/content rows left by prior crashes or eviction
+        // bugs. CleanupOrphanRows is idempotent and fast on clean DBs; running
+        // it at every startup is cheaper than letting orphan rowids accumulate
+        // and collide on the next InsertWithEmbedding.
+        MigrationRunner.CleanupOrphanRows(_conn);
+    }
+
+    /// <summary>
+    /// Test-friendly constructor. Borrows an already-opened connection that
+    /// the caller owns. Does NOT run migrations — the caller is expected to
+    /// have already done so. Disposal is the caller's responsibility.
+    /// </summary>
+    public SqliteStore(MsSqliteConnection connection)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        _conn = connection;
+        _ownsConnection = false;
+    }
+
+    /// <summary>
+    /// The underlying SQLite connection. Exposed so app-layer, one-time
+    /// migrations that must run raw SQL enlisted in their own transaction
+    /// (e.g. <see cref="TierV2DataMigration"/>) can borrow it. The store does
+    /// NOT surrender ownership — disposal still follows the constructor's
+    /// ownership rules.
+    /// </summary>
+    public MsSqliteConnection Connection => _conn;
+
+    private bool _transactionOpen;
+
+    /// <summary>
+    /// Begin an all-or-nothing store transaction (git sync). It runs on this
+    /// store's single connection: while one is open, <b>no other code may use
+    /// this connection</b> (this store's other methods, <c>VectorSearch</c>,
+    /// <c>ImportLog</c>, a background re-embed or periodic-sync thread all
+    /// share it), and a second <see cref="BeginTransaction"/> on the same
+    /// store throws <see cref="InvalidOperationException"/>. Sync runs on its
+    /// own connection. Observed behavior of Microsoft.Data.Sqlite: a command
+    /// created without this transaction on a connection with a pending
+    /// transaction fails with <see cref="InvalidOperationException"/>
+    /// ("Execute requires the command to have a transaction object"), so a
+    /// stray call fails loudly instead of joining or escaping the transaction.
+    /// Not on <see cref="IStore"/>.
+    /// </summary>
+    public SqliteStoreTransaction BeginTransaction()
+    {
+        if (_transactionOpen)
+            throw new InvalidOperationException(
+                "A store transaction is already open on this store");
+        var tx = _conn.BeginTransaction();
+        _transactionOpen = true;
+        return new SqliteStoreTransaction(this, _conn, tx);
+    }
+
+    internal void EndTransaction() => _transactionOpen = false;
+
+    // --- IStore -----------------------------------------------------
+
+    public string Insert(Tier tier, ContentType type, InsertEntryOpts opts)
+    {
+        ArgumentNullException.ThrowIfNull(opts);
+        var table = MigrationRunner.TableName(tier, type);
+        var id = opts.Id ?? Guid.NewGuid().ToString();
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        SqlRows.InsertRow(_conn, null, table, id, opts, now);
+        return id;
+    }
+
+    public string InsertWithEmbedding(
+        Tier tier,
+        ContentType type,
+        InsertEntryOpts opts,
+        ReadOnlyMemory<float> embedding)
+    {
+        ArgumentNullException.ThrowIfNull(opts);
+        var table = MigrationRunner.TableName(tier, type);
+        var vecTable = MigrationRunner.VecTableName(tier, type);
+        var id = opts.Id ?? Guid.NewGuid().ToString();
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        using var tx = _conn.BeginTransaction();
+        try
+        {
+            var rowid = SqlRows.InsertRow(_conn, tx, table, id, opts, now);
+            // Remove any orphan vec row at this rowid before inserting. An
+            // orphan exists when a previous content row was deleted without
+            // cleaning its vec counterpart (e.g. via the pre-fix write-time
+            // eviction path). Safe inside the transaction: the only
+            // legitimate occupant of this rowid in the vec table at this
+            // point is an orphan because we just acquired rowid by inserting
+            // the new content row.
+            VecRows.InsertWithOrphanCleanup(_conn, tx, vecTable, rowid, embedding);
+            tx.Commit();
+        }
+        catch
+        {
+            tx.Rollback();
+            throw;
+        }
+
+        return id;
+    }
+
+    public Entry? Get(Tier tier, ContentType type, string id) =>
+        SqlRows.ReadRow(_conn, null, MigrationRunner.TableName(tier, type), id);
+
+    public long? GetInternalKey(Tier tier, ContentType type, string id) =>
+        SqlRows.RowId(_conn, null, MigrationRunner.TableName(tier, type), id);
+
+    public void Update(Tier tier, ContentType type, string id, UpdateEntryOpts opts)
+    {
+        ArgumentNullException.ThrowIfNull(opts);
+        var table = MigrationRunner.TableName(tier, type);
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        SqlRows.UpdateRow(_conn, null, table, id, opts, now);
+    }
+
+    // Tier model v2 (Task 5). Sticky is hot-only: both methods operate on the
+    // hot_* table regardless of caller intent, since only those tables carry
+    // the `sticky` column.
+    public void SetSticky(ContentType type, string id, bool sticky) =>
+        SqlRows.SetStickyRow(_conn, null, type, id, sticky);
+
+    public bool IsSticky(ContentType type, string id) =>
+        SqlRows.IsStickyRow(_conn, null, type, id);
+
+    public void Delete(Tier tier, ContentType type, string id) =>
+        SqlRows.DeleteRow(_conn, null, MigrationRunner.TableName(tier, type), id);
+
+    public string? FindByContent(Tier tier, ContentType type, string content)
+    {
+        var table = MigrationRunner.TableName(tier, type);
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = $"SELECT id FROM {table} WHERE content = $content LIMIT 1";
+        cmd.Parameters.AddWithValue("$content", content);
+        return cmd.ExecuteScalar() as string;
+    }
+
+    public IReadOnlyList<Entry> List(Tier tier, ContentType type, ListEntriesOpts? opts = null)
+    {
+        var table = MigrationRunner.TableName(tier, type);
+        var orderBy = ParseOrderBy(opts?.OrderBy);
+
+        using var cmd = _conn.CreateCommand();
+        var sql = new StringBuilder();
+        sql.Append("SELECT * FROM ").Append(table);
+
+        var whereClauses = new List<string>();
+
+        if (opts?.GlobalOnly == true)
+        {
+            whereClauses.Add("project IS NULL");
+        }
+        else if (opts?.Project is not null)
+        {
+            if (opts.IncludeGlobal)
+                whereClauses.Add("(project = $project OR project IS NULL)");
+            else
+                whereClauses.Add("project = $project");
+            cmd.Parameters.AddWithValue("$project", opts.Project);
+        }
+
+        if (opts?.ParentId is not null)
+        {
+            whereClauses.Add("parent_id = $parent_id");
+            cmd.Parameters.AddWithValue("$parent_id", opts.ParentId);
+        }
+
+        if (opts?.Scopes is { Count: > 0 } scopes)
+        {
+            var scopeParams = new List<string>();
+            for (var i = 0; i < scopes.Count; i++)
+            {
+                var paramName = $"$scope{i}";
+                scopeParams.Add(paramName);
+                cmd.Parameters.AddWithValue(paramName, scopes[i]);
+            }
+            whereClauses.Add($"scope IN ({string.Join(", ", scopeParams)})");
+        }
+
+        if (opts?.EntryType is { } entryType)
+        {
+            whereClauses.Add("entry_type = $entry_type");
+            cmd.Parameters.AddWithValue("$entry_type", EntryTypeMapping.ToDbValue(entryType));
+        }
+
+        if (opts?.Source is not null)
+        {
+            whereClauses.Add("source = $source");
+            cmd.Parameters.AddWithValue("$source", opts.Source);
+        }
+
+        // Sticky filter (tier model v2, Task 5). Only hot_* tables carry the
+        // `sticky` column, so this clause is guarded to Tier.Hot — adding it to
+        // a warm/cold query would throw "no such column: sticky" (NM2). Sticky
+        // is NOT part of ORDER BY (single-column allowlist, NM1); sticky-first
+        // ordering is achieved by render order at the call sites.
+        if (tier.IsHot)
+        {
+            if (opts?.StickyOnly == true)
+                whereClauses.Add("sticky = 1");
+            else if (opts?.ExcludeSticky == true)
+                whereClauses.Add("sticky = 0");
+        }
+
+        if (whereClauses.Count > 0)
+            sql.Append(" WHERE ").Append(string.Join(" AND ", whereClauses));
+
+        sql.Append(" ORDER BY ").Append(orderBy);
+
+        if (opts?.Limit is int limit)
+        {
+            sql.Append(" LIMIT $limit");
+            cmd.Parameters.AddWithValue("$limit", limit);
+        }
+
+        cmd.CommandText = sql.ToString();
+        return ReadAll(cmd);
+    }
+
+    public int Count(Tier tier, ContentType type)
+    {
+        var table = MigrationRunner.TableName(tier, type);
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = $"SELECT COUNT(*) FROM {table}";
+        var result = cmd.ExecuteScalar();
+        return result is long l ? (int)l : 0;
+    }
+
+    public int CountKnowledgeCollections()
+    {
+        // Collections live in cold_knowledge only, NULL collection_ids excluded.
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText =
+            "SELECT COUNT(DISTINCT collection_id) FROM cold_knowledge WHERE collection_id IS NOT NULL";
+        var result = cmd.ExecuteScalar();
+        return result is long l ? (int)l : 0;
+    }
+
+    public IReadOnlyList<Entry> ListByMetadata(
+        Tier tier,
+        ContentType type,
+        IReadOnlyDictionary<string, string> metadataFilter,
+        ListEntriesOpts? opts = null)
+    {
+        ArgumentNullException.ThrowIfNull(metadataFilter);
+        if (metadataFilter.Count == 0)
+            throw new ArgumentException(
+                "metadataFilter must contain at least one key-value pair",
+                nameof(metadataFilter));
+
+        var table = MigrationRunner.TableName(tier, type);
+        var orderBy = ParseOrderBy(opts?.OrderBy);
+
+        using var cmd = _conn.CreateCommand();
+        var where = new List<string>();
+        var i = 0;
+        foreach (var kv in metadataFilter)
+        {
+            if (!MetadataKeyRegex.IsMatch(kv.Key))
+                throw new ArgumentException(
+                    $"Invalid metadata key: {kv.Key}",
+                    nameof(metadataFilter));
+            var paramName = $"$mv{i}";
+            where.Add($"json_extract(metadata, '$.{kv.Key}') = {paramName}");
+            cmd.Parameters.AddWithValue(paramName, kv.Value);
+            i++;
+        }
+
+        var sql = new StringBuilder();
+        sql.Append("SELECT * FROM ").Append(table)
+           .Append(" WHERE ").Append(string.Join(" AND ", where))
+           .Append(" ORDER BY ").Append(orderBy);
+
+        if (opts?.Limit is int limit)
+        {
+            sql.Append(" LIMIT $limit");
+            cmd.Parameters.AddWithValue("$limit", limit);
+        }
+
+        cmd.CommandText = sql.ToString();
+        return ReadAll(cmd);
+    }
+
+    public void Move(
+        Tier fromTier,
+        ContentType fromType,
+        Tier toTier,
+        ContentType toType,
+        string id)
+    {
+        var fromTable = MigrationRunner.TableName(fromTier, fromType);
+        var toTable = MigrationRunner.TableName(toTier, toType);
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        using var tx = _conn.BeginTransaction();
+        try
+        {
+            // Read + insert into the target, then delete the source, all in
+            // this one transaction.
+            SqlRows.CopyRow(_conn, tx, fromTable, toTable, id, now);
+            SqlRows.DeleteRow(_conn, tx, fromTable, id);
+            tx.Commit();
+        }
+        catch
+        {
+            tx.Rollback();
+            throw;
+        }
+    }
+
+    // --- row deserialization ---------------------------------------------
+
+    /// <summary>
+    /// Internal so sibling Infrastructure classes (HierarchicalIndex, etc.)
+    /// can deserialize raw rows without going through the
+    /// <see cref="IStore"/> CRUD interface — needed for queries that
+    /// filter on <c>parent_id</c> or <c>json_extract(metadata, ...)</c>,
+    /// which are not part of the standard CRUD surface.
+    /// </summary>
+    internal static Entry RowToEntry(SqliteDataReader reader)
+    {
+        string id = reader.GetString(reader.GetOrdinal("id"));
+        string content = reader.GetString(reader.GetOrdinal("content"));
+        var summary = ReadNullableString(reader, "summary");
+        var source = ReadNullableString(reader, "source");
+        var sourceToolStr = ReadNullableStringRaw(reader, "source_tool");
+        var sourceTool = SourceToolMapping.Parse(sourceToolStr);
+        var project = ReadNullableString(reader, "project");
+        var tagsStr = ReadNullableStringRaw(reader, "tags") ?? "[]";
+        var tags = TagsJson.Decode(tagsStr);
+        long createdAt = reader.GetInt64(reader.GetOrdinal("created_at"));
+        long updatedAt = reader.GetInt64(reader.GetOrdinal("updated_at"));
+        long lastAccessedAt = reader.GetInt64(reader.GetOrdinal("last_accessed_at"));
+        int accessCount = reader.GetInt32(reader.GetOrdinal("access_count"));
+        double decayScore = reader.GetDouble(reader.GetOrdinal("decay_score"));
+        var parentId = ReadNullableString(reader, "parent_id");
+        var collectionId = ReadNullableString(reader, "collection_id");
+        var scope = ReadNullableStringRaw(reader, "scope") ?? "";
+        var entryTypeStr = ReadNullableStringRaw(reader, "entry_type");
+        var entryType = EntryTypeMapping.ParseOrDefault(entryTypeStr);
+        var metadataJson = ReadNullableStringRaw(reader, "metadata") ?? "{}";
+        var timesInjected = reader.IsDBNull(reader.GetOrdinal("times_injected"))
+            ? 0 : reader.GetInt32(reader.GetOrdinal("times_injected"));
+
+        return new Entry(
+            id,
+            content,
+            summary,
+            source,
+            sourceTool,
+            project,
+            ListModule.OfSeq(tags),
+            createdAt,
+            updatedAt,
+            lastAccessedAt,
+            accessCount,
+            decayScore,
+            parentId,
+            collectionId,
+            scope,
+            entryType,
+            metadataJson,
+            timesInjected);
+    }
+
+    private static FSharpOption<string> ReadNullableString(SqliteDataReader reader, string name)
+    {
+        var ord = reader.GetOrdinal(name);
+        return reader.IsDBNull(ord)
+            ? FSharpOption<string>.None
+            : FSharpOption<string>.Some(reader.GetString(ord));
+    }
+
+    private static string? ReadNullableStringRaw(SqliteDataReader reader, string name)
+    {
+        var ord = reader.GetOrdinal(name);
+        return reader.IsDBNull(ord) ? null : reader.GetString(ord);
+    }
+
+    private IReadOnlyList<Entry> ReadAll(SqliteCommand cmd)
+    {
+        var results = new List<Entry>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            results.Add(RowToEntry(reader));
+        return results;
+    }
+
+    // --- order-by whitelist ----------------------------------------------
+
+    private static readonly HashSet<string> AllowedOrderColumns = new(StringComparer.Ordinal)
+    {
+        "created_at",
+        "updated_at",
+        "last_accessed_at",
+        "access_count",
+        "decay_score",
+        "content",
+    };
+
+    private static string ParseOrderBy(string? orderBy)
+    {
+        var input = string.IsNullOrWhiteSpace(orderBy) ? "created_at DESC" : orderBy;
+        var parts = input.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 0)
+            throw new ArgumentException("Invalid orderBy clause", nameof(orderBy));
+
+        var column = parts[0];
+        if (!AllowedOrderColumns.Contains(column))
+            throw new ArgumentException($"Invalid orderBy column: {column}", nameof(orderBy));
+
+        string direction;
+        if (parts.Length == 1)
+        {
+            direction = "DESC";
+        }
+        else if (parts.Length == 2)
+        {
+            if (parts[1].Equals("ASC", StringComparison.OrdinalIgnoreCase))
+                direction = "ASC";
+            else if (parts[1].Equals("DESC", StringComparison.OrdinalIgnoreCase))
+                direction = "DESC";
+            else
+                throw new ArgumentException($"Invalid orderBy direction: {parts[1]}", nameof(orderBy));
+        }
+        else
+        {
+            throw new ArgumentException($"Invalid orderBy format: {orderBy}", nameof(orderBy));
+        }
+        return $"{column} {direction}";
+    }
+
+    private static readonly Regex MetadataKeyRegex =
+        new(@"^[a-zA-Z_][a-zA-Z0-9_]*$", RegexOptions.Compiled);
+
+    // --- disposal ---------------------------------------------------------
+
+    /// <summary>
+    /// Phase 2 idea 1c — batch-increments times_injected for each entry.
+    /// Uses a single UPDATE per unique (tier, type) pair with an IN clause
+    /// to avoid N individual round-trips. Non-existent ids are silently ignored.
+    /// </summary>
+    public void UpdateInjectionCounts(IReadOnlyList<(Tier tier, ContentType type, string id)> entries)
+    {
+        if (entries is null || entries.Count == 0) return;
+
+        // Group by (tier, type) so we issue one UPDATE per table.
+        foreach (var group in entries.GroupBy(x => (x.tier, x.type)))
+        {
+            var table = MigrationRunner.TableName(group.Key.tier, group.Key.type);
+            var ids = group.Select(x => x.id).ToList();
+
+            using var cmd = _conn.CreateCommand();
+            var sql = new StringBuilder();
+            sql.Append("UPDATE ").Append(table)
+               .Append(" SET times_injected = times_injected + 1 WHERE id IN (");
+
+            for (var i = 0; i < ids.Count; i++)
+            {
+                if (i > 0) sql.Append(", ");
+                var paramName = $"$id{i}";
+                sql.Append(paramName);
+                cmd.Parameters.AddWithValue(paramName, ids[i]);
+            }
+            sql.Append(')');
+
+            cmd.CommandText = sql.ToString();
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_ownsConnection)
+            _conn.Dispose();
+    }
+
+    // --- IMetaStore -----------------------------------------------------
+
+    /// <inheritdoc />
+    public string? GetMeta(string key)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(key);
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "SELECT value FROM _meta WHERE key = $k";
+        cmd.Parameters.AddWithValue("$k", key);
+        var result = cmd.ExecuteScalar();
+        return result is string s ? s : null;
+    }
+
+    /// <inheritdoc />
+    public void SetMeta(string key, string value)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(key);
+        ArgumentNullException.ThrowIfNull(value);
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText =
+            "INSERT INTO _meta (key, value) VALUES ($k, $v) " +
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+        cmd.Parameters.AddWithValue("$k", key);
+        cmd.Parameters.AddWithValue("$v", value);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <inheritdoc />
+    public void DeleteMeta(string key)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(key);
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM _meta WHERE key = $k";
+        cmd.Parameters.AddWithValue("$k", key);
+        cmd.ExecuteNonQuery();
+    }
+}
+
+/// <summary>
+/// Bidirectional mapping between the F# <see cref="SourceTool"/> DU and the
+/// string values stored in the <c>source_tool</c> column. Throws on unknown
+/// strings — a silent default would mask data corruption.
+/// </summary>
+internal static class SourceToolMapping
+{
+    public static string ToDbValue(SourceTool tool)
+    {
+        if (tool.IsClaudeCode) return "claude-code";
+        if (tool.IsCopilotCli) return "copilot-cli";
+        if (tool.IsOpencode) return "opencode";
+        if (tool.IsCursor) return "cursor";
+        if (tool.IsCline) return "cline";
+        if (tool.IsHermes) return "hermes";
+        if (tool.IsManualSource) return "manual";
+        throw new ArgumentOutOfRangeException(nameof(tool), tool, "Unknown SourceTool");
+    }
+
+    /// <summary>
+    /// Tolerant counterpart of <see cref="Parse"/>: returns <c>None</c> for
+    /// <c>null</c> or a value this build does not know, and never throws. Used
+    /// where a record may come from a newer build (git sync reads records
+    /// written elsewhere); <see cref="Parse"/> keeps throwing on corruption.
+    /// </summary>
+    public static FSharpOption<SourceTool> TryParse(string? value) =>
+        value switch
+        {
+            "claude-code" => FSharpOption<SourceTool>.Some(SourceTool.ClaudeCode),
+            "copilot-cli" => FSharpOption<SourceTool>.Some(SourceTool.CopilotCli),
+            "opencode" => FSharpOption<SourceTool>.Some(SourceTool.Opencode),
+            "cursor" => FSharpOption<SourceTool>.Some(SourceTool.Cursor),
+            "cline" => FSharpOption<SourceTool>.Some(SourceTool.Cline),
+            "hermes" => FSharpOption<SourceTool>.Some(SourceTool.Hermes),
+            "manual" => FSharpOption<SourceTool>.Some(SourceTool.ManualSource),
+            _ => FSharpOption<SourceTool>.None,
+        };
+
+    public static FSharpOption<SourceTool> Parse(string? value)
+    {
+        if (value is null) return FSharpOption<SourceTool>.None;
+        SourceTool tool = value switch
+        {
+            "claude-code" => SourceTool.ClaudeCode,
+            "copilot-cli" => SourceTool.CopilotCli,
+            "opencode" => SourceTool.Opencode,
+            "cursor" => SourceTool.Cursor,
+            "cline" => SourceTool.Cline,
+            "hermes" => SourceTool.Hermes,
+            "manual" => SourceTool.ManualSource,
+            _ => throw new ArgumentException(
+                $"Unknown source_tool value: {value}", nameof(value)),
+        };
+        return FSharpOption<SourceTool>.Some(tool);
+    }
+}
+
+/// <summary>
+/// Bidirectional mapping between the F# <see cref="EntryType"/> DU and the
+/// string values stored in the <c>entry_type</c> column. We store the DU
+/// case name verbatim ("Correction", "Preference", etc.) so rows remain
+/// human-readable and forward-compatible with any future DU cases.
+///
+/// Parse is fail-safe: unknown or null values fall back to
+/// <see cref="EntryType.Preference"/>. This matches the column default and
+/// prevents a single malformed row from failing a wider <c>List</c> query —
+/// a silent default is acceptable here because <c>entry_type</c> is
+/// metadata, not load-bearing identity, and any future tightening can add
+/// validation at the insert path without changing the read path.
+/// </summary>
+internal static class EntryTypeMapping
+{
+    public static string ToDbValue(EntryType type)
+    {
+        if (type.IsCorrection) return "Correction";
+        if (type.IsPreference) return "Preference";
+        if (type.IsDecision) return "Decision";
+        if (type.IsSurfaced) return "Surfaced";
+        if (type.IsImported) return "Imported";
+        if (type.IsCompacted) return "Compacted";
+        if (type.IsIngested) return "Ingested";
+        throw new ArgumentOutOfRangeException(nameof(type), type, "Unknown EntryType");
+    }
+
+    public static EntryType ParseOrDefault(string? value) =>
+        value switch
+        {
+            "Correction" => EntryType.Correction,
+            "Preference" => EntryType.Preference,
+            "Decision" => EntryType.Decision,
+            "Surfaced" => EntryType.Surfaced,
+            "Imported" => EntryType.Imported,
+            "Compacted" => EntryType.Compacted,
+            "Ingested" => EntryType.Ingested,
+            _ => EntryType.Preference,
+        };
+}
+
+/// <summary>
+/// Hand-rolled JSON codec for the <c>tags</c> column. We only ever need
+/// <c>string[]</c>, so a dedicated 20-line codec is simpler (and cleaner for
+/// AOT) than pulling in a source-generated
+/// <see cref="System.Text.Json.Serialization.JsonSerializerContext"/>.
+/// </summary>
+internal static class TagsJson
+{
+    public static string Encode(IReadOnlyList<string>? tags)
+    {
+        if (tags is null || tags.Count == 0) return "[]";
+        var sb = new StringBuilder();
+        sb.Append('[');
+        for (var i = 0; i < tags.Count; i++)
+        {
+            if (i > 0) sb.Append(',');
+            AppendEscaped(sb, tags[i]);
+        }
+        sb.Append(']');
+        return sb.ToString();
+    }
+
+    public static string EncodeFList(FSharpList<string> tags)
+    {
+        if (tags is null || ListModule.IsEmpty(tags)) return "[]";
+        var sb = new StringBuilder();
+        sb.Append('[');
+        var first = true;
+        foreach (var t in tags)
+        {
+            if (!first) sb.Append(',');
+            AppendEscaped(sb, t);
+            first = false;
+        }
+        sb.Append(']');
+        return sb.ToString();
+    }
+
+    public static List<string> Decode(string json)
+    {
+        var result = new List<string>();
+        var span = json.AsSpan().Trim();
+        if (span.Length == 0 || span[0] != '[')
+            throw new FormatException("Invalid tags JSON: expected array");
+        var i = 1;
+
+        // Outer state machine: after the opening '[', we expect either an
+        // element or ']'. After each element we expect either ',' or ']'.
+        // After a ',' we strictly expect an element (no trailing commas).
+        // Tracking this explicitly rejects malformed input like ["a""b"]
+        // and ["a",].
+        bool expectSeparator = false;
+        bool afterComma = false;
+        while (true)
+        {
+            while (i < span.Length && char.IsWhiteSpace(span[i])) i++;
+            if (i >= span.Length)
+                throw new FormatException("Invalid tags JSON: unterminated array");
+
+            if (!expectSeparator)
+            {
+                if (span[i] == ']')
+                {
+                    if (afterComma)
+                        throw new FormatException("Invalid tags JSON: trailing comma");
+                    return result;
+                }
+                if (span[i] != '"')
+                    throw new FormatException("Invalid tags JSON: expected string");
+                i++; // consume opening quote
+                var sb = new StringBuilder();
+                while (i < span.Length && span[i] != '"')
+                {
+                    if (span[i] == '\\' && i + 1 < span.Length)
+                    {
+                        var esc = span[i + 1];
+                        switch (esc)
+                        {
+                            case '"': sb.Append('"'); break;
+                            case '\\': sb.Append('\\'); break;
+                            case '/': sb.Append('/'); break;
+                            case 'b': sb.Append('\b'); break;
+                            case 'f': sb.Append('\f'); break;
+                            case 'n': sb.Append('\n'); break;
+                            case 'r': sb.Append('\r'); break;
+                            case 't': sb.Append('\t'); break;
+                            case 'u':
+                                if (i + 5 >= span.Length)
+                                    throw new FormatException("Invalid \\u escape");
+                                var hex = span.Slice(i + 2, 4);
+                                var unit = (char)int.Parse(hex, System.Globalization.NumberStyles.HexNumber);
+                                if (char.IsHighSurrogate(unit))
+                                {
+                                    // Require immediately-following \uXXXX that is a low surrogate.
+                                    if (i + 11 >= span.Length ||
+                                        span[i + 6] != '\\' || span[i + 7] != 'u')
+                                        throw new FormatException("invalid \\u escape sequence: unpaired surrogate");
+                                    var hex2 = span.Slice(i + 8, 4);
+                                    var unit2 = (char)int.Parse(hex2, System.Globalization.NumberStyles.HexNumber);
+                                    if (!char.IsLowSurrogate(unit2))
+                                        throw new FormatException("invalid \\u escape sequence: unpaired surrogate");
+                                    sb.Append(unit);
+                                    sb.Append(unit2);
+                                    i += 10; // consume first \uXXXX body (4) + second \uXXXX (6)
+                                }
+                                else if (char.IsLowSurrogate(unit))
+                                {
+                                    throw new FormatException("invalid \\u escape sequence: unpaired surrogate");
+                                }
+                                else
+                                {
+                                    sb.Append(unit);
+                                    i += 4;
+                                }
+                                break;
+                            default:
+                                throw new FormatException($"Invalid escape \\{esc}");
+                        }
+                        i += 2;
+                    }
+                    else
+                    {
+                        sb.Append(span[i]);
+                        i++;
+                    }
+                }
+                if (i >= span.Length)
+                    throw new FormatException("Invalid tags JSON: unterminated string");
+                i++; // consume closing quote
+                result.Add(sb.ToString());
+                expectSeparator = true;
+                afterComma = false;
+            }
+            else
+            {
+                if (span[i] == ']') return result;
+                if (span[i] == ',')
+                {
+                    i++;
+                    expectSeparator = false;
+                    afterComma = true;
+                    continue;
+                }
+                throw new FormatException("Invalid tags JSON: expected ',' or ']'");
+            }
+        }
+    }
+
+    private static void AppendEscaped(StringBuilder sb, string s)
+    {
+        sb.Append('"');
+        foreach (var c in s)
+        {
+            switch (c)
+            {
+                case '"': sb.Append("\\\""); break;
+                case '\\': sb.Append("\\\\"); break;
+                case '\b': sb.Append("\\b"); break;
+                case '\f': sb.Append("\\f"); break;
+                case '\n': sb.Append("\\n"); break;
+                case '\r': sb.Append("\\r"); break;
+                case '\t': sb.Append("\\t"); break;
+                default:
+                    if (c < 0x20)
+                        sb.Append("\\u").Append(((int)c).ToString("x4"));
+                    else
+                        sb.Append(c);
+                    break;
+            }
+        }
+                sb.Append('"');
+    }
+}
